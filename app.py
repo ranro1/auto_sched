@@ -5,265 +5,385 @@ import pandas as pd
 import json
 import os
 from dotenv import load_dotenv
+from google_calendar import get_google_calendar_service, add_event_to_calendar, get_week_events, convert_to_dataframe
+import time
+
 
 # Load environment variables
 load_dotenv()
 
 # Configure Gemini
 genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-model = genai.GenerativeModel('gemini-pro')
+model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Initialize session states
-if 'current_week' not in st.session_state:
-    st.session_state.current_week = datetime.now()
-if 'events' not in st.session_state:
-    st.session_state.events = []
-if 'selected_slot' not in st.session_state:
-    st.session_state.selected_slot = None
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
 
-# Custom CSS for calendar styling
+def parse_natural_language(prompt):
+    """Use Gemini to parse natural language into structured event details."""
+    try:
+        # Create a prompt for Gemini to extract event details
+        system_prompt = """
+        Extract event details from the following text and return a JSON object with:
+        - title: The event title/description
+        - day: The day of the week (MON, TUE, WED, THU, FRI, SAT, SUN) if specified
+        - date: The date in format YYYY-MM-DD if specified (if year is not provided, use current year)
+        - time: The time in 12-hour format with AM/PM (e.g., "05:00 PM")
+        - duration: Duration in minutes (default to 30 if not specified)
+        
+        Example outputs:
+        For day-based scheduling:
+        {
+            "title": "Call with John",
+            "day": "MON",
+            "time": "05:00 PM",
+            "duration": 30
+        }
+        
+        For date-based scheduling:
+        {
+            "title": "Team Meeting",
+            "date": "2024-03-25",
+            "time": "05:00 PM",
+            "duration": 60
+        }
+        """
+        
+        # Get structured response from Gemini
+        response = model.generate_content(f"{system_prompt}\n\nText: {prompt}")
+        
+        # Extract JSON from response
+        try:
+            # Find JSON in the response
+            json_str = response.text[response.text.find('{'):response.text.rfind('}')+1]
+            event_details = json.loads(json_str)
+            
+            # Validate required fields
+            if not all(k in event_details for k in ['title', 'time']):
+                raise ValueError("Missing required fields in response")
+            
+            # Standardize time format
+            time_str = event_details['time'].upper()
+            if 'AM' not in time_str and 'PM' not in time_str:
+                time_str += ' PM' if int(time_str.split(':')[0]) < 12 else ' AM'
+            event_details['time'] = time_str
+            
+            # Standardize day format if present
+            if 'day' in event_details:
+                day_map = {
+                    'MONDAY': 'MON', 'TUESDAY': 'TUE', 'WEDNESDAY': 'WED',
+                    'THURSDAY': 'THU', 'FRIDAY': 'FRI', 'SATURDAY': 'SAT', 'SUNDAY': 'SUN',
+                    'MON': 'MON', 'TUE': 'TUE', 'WED': 'WED', 'THU': 'THU',
+                    'FRI': 'FRI', 'SAT': 'SAT', 'SUN': 'SUN'
+                }
+                event_details['day'] = day_map.get(event_details['day'].upper(), 'MON')
+            
+            # Set default duration if not specified
+            if 'duration' not in event_details:
+                event_details['duration'] = 30
+            
+            return event_details
+        except json.JSONDecodeError:
+            raise ValueError("Could not parse event details from response")
+    except Exception as e:
+        raise Exception(f"Error parsing natural language: {str(e)}")
+
+def schedule_event(event_details):
+    """Schedule an event in Google Calendar using event details."""
+    try:
+        # Convert time to 24-hour format
+        try:
+            # Try parsing with leading zero format first
+            time_obj = datetime.strptime(event_details['time'], '%I:%M %p')
+        except ValueError:
+            try:
+                # Try parsing without leading zero
+                time_obj = datetime.strptime(event_details['time'], '%I %p')
+            except ValueError:
+                raise ValueError("Invalid time format. Please use format like '05:00 PM'")
+        
+        # Calculate event date based on whether day or date is provided
+        if 'date' in event_details:
+            # Date-based scheduling
+            try:
+                # If date doesn't include year, add current year
+                if len(event_details['date'].split('-')) == 2:
+                    current_year = datetime.now().year
+                    event_details['date'] = f"{current_year}-{event_details['date']}"
+                
+                event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
+                
+                # If the date is in the past, find the next occurrence in the current year
+                if event_date < datetime.now():
+                    event_date = event_date.replace(year=datetime.now().year + 1)
+            except ValueError:
+                raise ValueError("Invalid date format. Please use YYYY-MM-DD or MM-DD format")
+        else:
+            # Day-based scheduling
+            start_date = datetime.now() - timedelta(days=datetime.now().weekday())
+            day_offset = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'].index(event_details['day'])
+            event_date = start_date + timedelta(days=day_offset)
+            
+            # If the day is in the past, move to next week
+            if event_date < datetime.now():
+                event_date += timedelta(days=7)
+        
+        # Create start and end datetime in UTC
+        start_datetime = datetime.combine(event_date.date(), time_obj.time())
+        # Convert to UTC to avoid timezone issues
+        start_datetime = start_datetime.replace(tzinfo=None)
+        end_datetime = start_datetime + timedelta(minutes=event_details['duration'])
+        
+        # Create event details
+        event_data = {
+            'Task': event_details['title'],
+            'Start DateTime': start_datetime,
+            'End DateTime': end_datetime,
+            'ColorId': '1'  # Default blue color
+        }
+        
+        # Add event to Google Calendar
+        event_link = add_event_to_calendar(st.session_state.calendar_service, event_data)
+        return start_datetime, end_datetime, event_link
+    except Exception as e:
+        raise Exception(f"Error scheduling event: {str(e)}")
+
+def parse_schedule_prompt(prompt):
+    """Parse the scheduling prompt to extract event details."""
+    import re
+    
+    # Default values
+    task_name = "Meeting"
+    day = None
+    time_str = None
+    duration = 30
+    
+    # Extract task name
+    task_match = re.search(r'([^0-9]+)(?:\s+on|\s+at|\s+for)', prompt, re.IGNORECASE)
+    if task_match:
+        task_name = task_match.group(1).strip()
+    
+    # Extract day
+    day_match = re.search(r'(?:on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)', prompt, re.IGNORECASE)
+    if day_match:
+        day = day_match.group(1).upper()[:3]
+    
+    # Extract time
+    time_match = re.search(r'at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)', prompt, re.IGNORECASE)
+    if time_match:
+        time_str = time_match.group(1)
+    
+    # Extract duration
+    duration_match = re.search(r'for\s+(\d+)\s*(?:min|minutes|mins|hour|hours|hr|hrs)', prompt, re.IGNORECASE)
+    if duration_match:
+        duration = int(duration_match.group(1))
+    
+    return task_name, day, time_str, duration
+
+
+# Initialize Google Calendar service
+if 'calendar_service' not in st.session_state:
+    try:
+        st.session_state.calendar_service = get_google_calendar_service()
+    except Exception as e:
+        st.error("Please set up Google Calendar credentials. See README for instructions.")
+        st.stop()
+
+# Set page config
+st.set_page_config(layout="wide", page_title="My Private Scheduler")
+
+# Custom CSS for styling
 st.markdown("""
 <style>
-    /* Dark theme and general styles */
-    .stApp {
-        background-color: #202124;
-        color: #ffffff;
-    }
-    
-    /* Calendar container */
-    .calendar-container {
-        background-color: #2d2e31;
-        border-radius: 8px;
-        padding: 10px;
-        margin: 10px 0;
-    }
-    
-    /* Time column */
-    .time-column {
-        color: #70757a;
-        font-size: 12px;
-        text-align: right;
-        padding-right: 10px;
-        border-right: 1px solid #333;
-    }
-    
-    /* Calendar grid */
-    .calendar-grid {
-        display: grid;
-        grid-template-columns: 80px repeat(7, 1fr);
-        gap: 1px;
-        background-color: #333;
-    }
-    
-    /* Time slot */
-    .time-slot {
-        background-color: #2d2e31;
-        padding: 4px;
-        min-height: 30px;
-        border-bottom: 1px solid #333;
-        cursor: pointer;
-        position: relative;
-    }
-    .time-slot:hover {
-        background-color: #3c4043;
-    }
-    
-    /* Event block */
-    .event-block {
-        background-color: #1a73e8;
-        color: white;
-        border-radius: 4px;
-        padding: 4px 8px;
-        margin: 2px 0;
-        font-size: 12px;
-        cursor: pointer;
-        position: relative;
-        z-index: 2;
-    }
-    .event-block:hover {
-        filter: brightness(1.1);
-    }
-    
-    /* Current time indicator */
-    .current-time {
-        border-top: 2px solid #ea4335;
-        position: absolute;
+    /* Calendar styling */
+    .calendar-iframe {
         width: 100%;
-        z-index: 1;
+        height: calc(100vh - 100px);
+        min-height: 800px;
+        border: none;
+        margin-top: 10px;
     }
     
-    /* Day header */
-    .day-header {
-        background-color: #2d2e31;
-        padding: 8px;
-        text-align: center;
-        font-weight: bold;
-        border-bottom: 1px solid #333;
-    }
-    .current-day {
-        color: #1a73e8;
-    }
-    
-    /* Navigation */
-    .nav-container {
+    /* Chat layout styling */
+    .chat-container {
         display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 10px;
-        background-color: #2d2e31;
-        border-radius: 8px;
-        margin-bottom: 10px;
+        flex-direction: column;
+        height: 100vh;
+        position: relative;
+    }
+    
+    .chat-title {
+        padding: 15px;
+        font-size: 24px;
+        font-weight: bold;
+        border-bottom: 1px solid #eee;
+    }
+    
+    .chat-messages-container {
+        flex: 1;
+        overflow-y: auto;
+        padding: 15px;
+        margin-bottom: 80px; /* Space for the input */
+    }
+    
+    .chat-input-container {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        background-color: white;
+        padding: 15px;
+        border-top: 1px solid #eee;
+        z-index: 100;
+    }
+    
+    /* Message styling */
+    .message {
+        max-width: 80%;
+        padding: 12px 16px;
+        border-radius: 15px;
+        margin: 5px 0;
+        font-size: 16px;
+        line-height: 1.4;
+    }
+    
+    .user-message {
+        background-color: #e3f2fd;
+        color: black;
+        margin-left: auto;
+        margin-right: 0;
+        border-bottom-right-radius: 5px;
+        text-align: right;
+    }
+    
+    .assistant-message {
+        background-color: #f5f5f5;
+        color: black;
+        margin-right: auto;
+        margin-left: 0;
+        border-bottom-left-radius: 5px;
+        text-align: left;
+    }
+    
+    /* Hide streamlit branding */
+    #MainMenu, footer, header {
+        visibility: hidden;
     }
 </style>
 """, unsafe_allow_html=True)
 
-def format_time(dt, format_12h=False):
-    """Format time in either 24h or 12h format"""
-    if format_12h:
-        return dt.strftime("%I:%M %p").lstrip("0")
-    return dt.strftime("%H:%M")
 
-def create_time_slots():
-    """Create 30-minute time slots from 8 AM to 8 PM"""
-    slots = []
-    start = datetime.strptime("08:00", "%H:%M")
-    end = datetime.strptime("20:00", "%H:%M")
-    current = start
-    while current <= end:
-        slots.append(current)
-        current += timedelta(minutes=30)
-    return slots
+# Initialize session state for chat history
+if 'messages' not in st.session_state:
+    st.session_state.messages = [
+        {"role": "assistant", "content": "Hello! I'm your private scheduler. How can I help you plan your time today?"}
+    ]
 
-def is_current_time_slot(time_slot, day):
-    """Check if this is the current time slot"""
-    now = datetime.now()
-    return (now.strftime("%A").upper()[:3] == day and 
-            time_slot.hour == now.hour and 
-            time_slot.minute <= now.minute < time_slot.minute + 30)
 
-def handle_slot_click(day, time_slot):
-    """Handle click on a time slot"""
-    st.session_state.selected_slot = {
-        'day': day,
-        'time': time_slot
-    }
+# Initialize last_prompt to avoid loops
+if 'last_prompt' not in st.session_state:
+    st.session_state.last_prompt = None
 
-def create_calendar():
-    """Create the calendar grid"""
-    # Navigation
-    col1, col2, col3, col4, col5 = st.columns([1, 2, 6, 2, 1])
-    with col1:
-        if st.button("←"):
-            st.session_state.current_week -= timedelta(days=7)
-    with col2:
-        if st.button("Today"):
-            st.session_state.current_week = datetime.now()
-    with col3:
-        start_date = st.session_state.current_week - timedelta(days=st.session_state.current_week.weekday())
-        st.markdown(f"### {start_date.strftime('%B %Y')}")
-    with col5:
-        if st.button("→"):
-            st.session_state.current_week += timedelta(days=7)
+# Function to add a message to the chat history
+def add_message(role, content):
+    st.session_state.messages.append({"role": role, "content": content})
 
-    # Calendar grid
-    week_days = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
-    dates = [(start_date + timedelta(days=i)) for i in range(7)]
-    
-    # Day headers
-    st.markdown('<div class="calendar-grid">', unsafe_allow_html=True)
-    st.markdown('<div class="time-column"></div>', unsafe_allow_html=True)
-    for i, (day, date) in enumerate(zip(week_days, dates)):
-        is_current = date.date() == datetime.now().date()
-        st.markdown(
-            f'<div class="day-header {"current-day" if is_current else ""}">'
-            f'{day}<br>{date.strftime("%d")}</div>',
-            unsafe_allow_html=True
-        )
-    
-    # Time slots and events
-    time_slots = create_time_slots()
-    for time_slot in time_slots:
-        # Time column
-        st.markdown(
-            f'<div class="time-column">{format_time(time_slot)}</div>',
-            unsafe_allow_html=True
-        )
-        
-        # Day columns
-        for day in week_days:
-            events = [e for e in st.session_state.events 
-                     if e['day'] == day and 
-                     datetime.strptime(e['start_time'], "%H:%M") <= time_slot < 
-                     datetime.strptime(e['end_time'], "%H:%M")]
-            
-            slot_html = f'<div class="time-slot" onclick="handle_slot_click(\'{day}\', \'{format_time(time_slot)}\')">'
-
-            # Current time indicator
-            if is_current_time_slot(time_slot, day):
-                slot_html += '<div class="current-time"></div>'
-            
-            # Events
-            for event in events:
-                slot_html += f"""
-                <div class="event-block" style="background-color: {event.get('color', '#1a73e8')}">
-                    {event['title']}<br>
-                    <small>{event['start_time']} - {event['end_time']}</small>
-                </div>
-                """
-            
-            slot_html += '</div>'
-            st.markdown(slot_html, unsafe_allow_html=True)
-    
-    st.markdown('</div>', unsafe_allow_html=True)
 
 # Main layout - Two columns
 col1, col2 = st.columns([1, 2])
 
 # Left column - Chat interface
 with col1:
-    # Chat container
-    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
     
-    # Messages area
-    st.markdown('<div class="chat-messages">', unsafe_allow_html=True)
+    # Title
+    st.markdown('<div class="chat-title">Schedule Assistant</div>', unsafe_allow_html=True)
+
+    # st.markdown('<div class="chat-container">', unsafe_allow_html=True)
     
-    # Display messages
+    # Messages container
+    st.markdown('<div class="chat-messages-container">', unsafe_allow_html=True)
     for message in st.session_state.messages:
         message_class = "user-message" if message["role"] == "user" else "assistant-message"
         st.markdown(
             f'<div class="message {message_class}">{message["content"]}</div>',
             unsafe_allow_html=True
         )
-    
     st.markdown('</div>', unsafe_allow_html=True)
     
-    # Input area
-    st.markdown('<div class="chat-input">', unsafe_allow_html=True)
+    # Input container
+    st.markdown('<div class="chat-input-container">', unsafe_allow_html=True)
     if prompt := st.chat_input("What would you like to schedule?"):
-        # Add user message
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        # Get assistant response
-        chat_response = model.generate_content(f"""
-        You are a helpful scheduling assistant. The user said: "{prompt}"
-        Current schedule: {json.dumps(st.session_state.events)}
-        Please provide a helpful response and suggest any schedule changes.
-        """)
-        
-        # Add assistant response
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": chat_response.candidates[0].content.parts[0].text
-        })
-        
-        # Rerun to update chat
-        st.rerun()
+        if prompt != st.session_state.last_prompt:
+            st.session_state.last_prompt = prompt
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            
+            try:
+                event_details = parse_natural_language(prompt)
+                start_datetime, end_datetime, event_link = schedule_event(event_details)
+                response = f"Scheduled {event_details['title']} on {event_details['day']} from {start_datetime.strftime('%I:%M %p')} to {end_datetime.strftime('%I:%M %p')}"
+                st.session_state.messages.append({"role": "assistant", "content": response})
+                st.rerun()
+            except Exception as e:
+                error_msg = f"I couldn't schedule the event. Error: {str(e)}"
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                st.rerun()
     
-    st.markdown('</div></div>', unsafe_allow_html=True)
+    # st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# Right column - Calendar
+
+
+# Right column - Google Calendar view
 with col2:
-    st.title("Calendar")
-    create_calendar()
+    # Calendar section
+    st.markdown('<div class="calendar-container">', unsafe_allow_html=True)
+    try:
+        calendar_list = st.session_state.calendar_service.calendarList().list().execute()
+        primary_calendar = next((cal for cal in calendar_list.get('items', []) if cal.get('primary')), None)
+        
+        if primary_calendar:
+            calendar_id = primary_calendar['id']
+            timestamp = int(time.time())
+            calendar_url = (
+                f"https://calendar.google.com/calendar/embed?"
+                f"src={calendar_id}&"
+                f"height=1000&"
+                f"wkst=1&"
+                f"bgcolor=%231a1a1a&"
+                f"ctz={datetime.now().astimezone().tzinfo}&"
+                f"mode=WEEK&"
+                f"showTitle=1&"
+                f"showNav=1&"
+                f"showDate=1&"
+                f"showPrint=0&"
+                f"showTabs=1&"
+                f"showCalendars=1&"
+                f"showTz=1&"
+                f"hl=en&"
+                f"t={timestamp}"
+            )
+            
+            st.markdown("""
+                <script>
+                    function refreshCalendar() {
+                        const iframe = document.querySelector('.calendar-iframe');
+                        const currentSrc = iframe.src;
+                        const newSrc = currentSrc.replace(/t=\\d+/, 't=' + Math.floor(Date.now() / 1000));
+                        iframe.src = newSrc;
+                    }
+                    setInterval(refreshCalendar, 15000);
+                </script>
+            """, unsafe_allow_html=True)
+            
+            st.markdown(f"""
+                <iframe 
+                    class="calendar-iframe"
+                    src="{calendar_url}"
+                    frameborder="0">
+                </iframe>
+            """, unsafe_allow_html=True)
+        else:
+            st.error("Could not find your primary calendar. Please make sure you're properly authenticated.")
+    except Exception as e:
+        st.error(f"Error loading calendar: {str(e)}")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True) 

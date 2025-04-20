@@ -60,11 +60,11 @@ def add_event_to_calendar(service, event_details):
         'summary': event_details['Task'],
         'start': {
             'dateTime': event_details['Start DateTime'].isoformat(),
-            'timeZone': 'UTC',
+            'timeZone': 'America/New_York',  # Fixed timezone that works with Google Calendar
         },
         'end': {
             'dateTime': event_details['End DateTime'].isoformat(),
-            'timeZone': 'UTC',
+            'timeZone': 'America/New_York',  # Fixed timezone that works with Google Calendar
         },
         'colorId': event_details.get('ColorId', '1'),  # Default blue color
     }
