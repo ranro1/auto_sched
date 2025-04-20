@@ -1,12 +1,11 @@
 import streamlit as st
-import pandas as pd
-import datetime
-import random
 import google.generativeai as genai
 from datetime import datetime, timedelta
+import pandas as pd
 import json
 import os
 from dotenv import load_dotenv
+from scheduler import Scheduler
 from google_calendar import get_google_calendar_service, add_event_to_calendar, get_week_events, convert_to_dataframe
 
 # Load environment variables
@@ -24,29 +23,27 @@ if 'calendar_service' not in st.session_state:
         st.error("Please set up Google Calendar credentials. See README for instructions.")
         st.stop()
 
-# Set page config
-st.set_page_config(layout="wide", page_title="My Private Scheduler")
+# Initialize session state
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'last_prompt' not in st.session_state:
+    st.session_state.last_prompt = None
 
 # Custom CSS for styling
 st.markdown("""
 <style>
     /* Calendar styling */
-    
-    .calendar-iframe {
-        width: 100%;
-        height: calc(100vh - 100px);
-        min-height: 800px;
-        border: none;
-        margin-top: 10px;
+    .calendar-container {
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        overflow: hidden;
     }
-    
     .calendar-header {
         background-color: #f8f9fa;
         padding: 10px;
         border-bottom: 1px solid #ddd;
         font-weight: bold;
     }
-    
     .time-slot {
         border-top: 1px solid #eee;
         padding: 8px;
@@ -65,11 +62,7 @@ st.markdown("""
     .chat-messages {
         flex-grow: 1;
         overflow-y: auto;
-        padding: 20px;
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-        height: calc(100vh - 200px);
+        margin: 0;
     }
     
     /* Message bubbles */
@@ -106,10 +99,6 @@ st.markdown("""
     .chat-input {
         padding: 20px;
         border-top: 1px solid #ddd;
-        position: sticky;
-        bottom: 0;
-        background-color: white;
-        z-index: 100;
     }
 
     /* Style the input field */
@@ -195,53 +184,41 @@ def schedule_event(task_name, day, time_str, duration):
     except Exception as e:
         raise Exception(f"Error scheduling event: {str(e)}")
 
-# Initialize session state for chat history
-if 'messages' not in st.session_state:
-    st.session_state.messages = [
-        {"role": "assistant", "content": "Hello! I'm your private scheduler. How can I help you plan your time today?"}
-    ]
-
-# Initialize and manage week navigation
-if 'current_week_offset' not in st.session_state:
-    st.session_state.current_week_offset = 0
-
-# Initialize last_prompt to avoid loops
-if 'last_prompt' not in st.session_state:
-    st.session_state.last_prompt = None
-
-# Function to add a message to the chat history
-def add_message(role, content):
-    st.session_state.messages.append({"role": role, "content": content})
-
-# Get current date and calculate displayed week based on offset
-today = datetime.now().date()
-start_of_week = today - timedelta(days=today.weekday()) + timedelta(weeks=st.session_state.current_week_offset)
-
 # Main layout - Two columns
 col1, col2 = st.columns([1, 2])
 
-# Left column - Chat interface
-with col1:
-    # Create a container for the chat area
-    chat_container = st.container()
-    
-    with chat_container:
-        # Messages area
-        st.markdown('<div class="chat-messages">', unsafe_allow_html=True)
-        for message in st.session_state.messages:
-            message_class = "user-message" if message["role"] == "user" else "assistant-message"
-            st.markdown(
-                f'<div class="message {message_class}">{message["content"]}</div>',
-                unsafe_allow_html=True
-            )
-        st.markdown('</div>', unsafe_allow_html=True)
+# Calendar section
+st.markdown('<div class="calendar-container">', unsafe_allow_html=True)
+st.markdown("""
+    <iframe 
+        class="calendar-iframe"
+        src="https://calendar.google.com/calendar/embed?height=600&wkst=1&bgcolor=%231a1a1a&ctz=UTC&mode=WEEK&showTitle=0&showNav=1&showDate=1&showPrint=0&showTabs=0&showCalendars=0&showTz=0"
+        frameborder="0" 
+        scrolling="no">
+    </iframe>
+""", unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
+
+# Chat section
+st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+st.subheader("Chat with your Assistant")
+
+# Display chat messages
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+
+# Chat input
+if prompt := st.chat_input("What would you like to schedule?"):
+    # Check if this is a new prompt to avoid loops
+    if prompt != st.session_state.last_prompt:
+        st.session_state.last_prompt = prompt
+        st.session_state.messages.append({"role": "user", "content": prompt})
         
-        # Input area
-        st.markdown('<div class="chat-input">', unsafe_allow_html=True)
-        if prompt := st.chat_input("What would you like to schedule?"):
-            # Add user message to chat history
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            
+        with st.chat_message("user"):
+            st.write(prompt)
+        
+        with st.chat_message("assistant"):
             try:
                 # Parse the prompt and schedule the event
                 task_name, day, time_str, duration = parse_schedule_prompt(prompt)
@@ -251,6 +228,8 @@ with col1:
                     
                     # Show confirmation
                     response = f"Scheduled {task_name} on {day} from {start_datetime.strftime('%I:%M %p')} to {end_datetime.strftime('%I:%M %p')}"
+                    st.write(response)
+                    st.write(f"[View in Google Calendar]({event_link})")
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": response
@@ -259,32 +238,17 @@ with col1:
                     # Force page refresh to show updated calendar
                     st.experimental_rerun()
                 else:
+                    st.write("Please provide both day and time for scheduling. Example: 'Meeting on Monday at 2pm for 30 mins'")
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": "Please provide both day and time for scheduling. Example: 'Meeting on Monday at 2pm for 30 mins'"
                     })
             except Exception as e:
+                st.write(f"I couldn't schedule the event. Error: {str(e)}")
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": f"I couldn't schedule the event. Error: {str(e)}"
                 })
-            
-            # Force page refresh to show new messages
-            st.experimental_rerun()
-        
-        st.markdown('</div>', unsafe_allow_html=True)
 
-# Right column - Google Calendar view
-with col2:
-    st.markdown("### Weekly Schedule")
-    
-    # Calendar display
-    st.markdown("""
-        <iframe 
-            class="calendar-iframe"
-            src="https://calendar.google.com/calendar/embed?height=600&wkst=1&bgcolor=%23ffffff&ctz=UTC&mode=WEEK&showTitle=0&showNav=1&showDate=1&showPrint=0&showTabs=0&showCalendars=0&showTz=0"
-            frameborder="0" 
-            scrolling="no">
-        </iframe>
-    """, unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True) 
