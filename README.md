@@ -1,5 +1,7 @@
 # Personal Scheduler Assistant
 
+By: Ran, Nipun and Puneet
+
 A smart scheduling assistant powered by Google's Gemini AI that helps you manage your weekly schedule efficiently.
 
 ## Features
