@@ -5,7 +5,6 @@ import pandas as pd
 import json
 import os
 from dotenv import load_dotenv
-from scheduler import Scheduler
 
 # Load environment variables
 load_dotenv()
@@ -14,33 +13,31 @@ load_dotenv()
 genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
 model = genai.GenerativeModel('gemini-pro')
 
-# Initialize scheduler
-if 'scheduler' not in st.session_state:
-    st.session_state.scheduler = Scheduler()
+# Initialize session states
 if 'current_week' not in st.session_state:
     st.session_state.current_week = datetime.now()
-
-# Initialize session state
+if 'events' not in st.session_state:
+    st.session_state.events = []
+if 'selected_slot' not in st.session_state:
+    st.session_state.selected_slot = None
 if 'messages' not in st.session_state:
     st.session_state.messages = []
-if 'schedule' not in st.session_state:
-    st.session_state.schedule = pd.DataFrame(columns=['Task', 'Start Time', 'End Time', 'Priority', 'Status', 'Day', 'Color'])
 
-# Custom CSS for dark theme and calendar styling
+# Custom CSS for calendar styling
 st.markdown("""
 <style>
-    /* Dark theme */
+    /* Dark theme and general styles */
     .stApp {
         background-color: #202124;
         color: #ffffff;
     }
     
-    /* Calendar header */
-    .calendar-header {
+    /* Calendar container */
+    .calendar-container {
         background-color: #2d2e31;
-        padding: 10px;
         border-radius: 8px;
-        margin-bottom: 10px;
+        padding: 10px;
+        margin: 10px 0;
     }
     
     /* Time column */
@@ -49,176 +46,224 @@ st.markdown("""
         font-size: 12px;
         text-align: right;
         padding-right: 10px;
+        border-right: 1px solid #333;
     }
     
     /* Calendar grid */
     .calendar-grid {
-        border: 1px solid #333;
-        background-color: #2d2e31;
+        display: grid;
+        grid-template-columns: 80px repeat(7, 1fr);
+        gap: 1px;
+        background-color: #333;
     }
     
-    /* Event blocks */
+    /* Time slot */
+    .time-slot {
+        background-color: #2d2e31;
+        padding: 4px;
+        min-height: 30px;
+        border-bottom: 1px solid #333;
+        cursor: pointer;
+        position: relative;
+    }
+    .time-slot:hover {
+        background-color: #3c4043;
+    }
+    
+    /* Event block */
     .event-block {
+        background-color: #1a73e8;
+        color: white;
         border-radius: 4px;
         padding: 4px 8px;
         margin: 2px 0;
-        font-size: 14px;
+        font-size: 12px;
+        cursor: pointer;
+        position: relative;
+        z-index: 2;
+    }
+    .event-block:hover {
+        filter: brightness(1.1);
     }
     
-    /* Navigation buttons */
-    .nav-button {
-        background-color: transparent;
-        border: none;
-        color: #ffffff;
-        cursor: pointer;
+    /* Current time indicator */
+    .current-time {
+        border-top: 2px solid #ea4335;
+        position: absolute;
+        width: 100%;
+        z-index: 1;
+    }
+    
+    /* Day header */
+    .day-header {
+        background-color: #2d2e31;
+        padding: 8px;
+        text-align: center;
+        font-weight: bold;
+        border-bottom: 1px solid #333;
+    }
+    .current-day {
+        color: #1a73e8;
+    }
+    
+    /* Navigation */
+    .nav-container {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px;
+        background-color: #2d2e31;
+        border-radius: 8px;
+        margin-bottom: 10px;
     }
 </style>
 """, unsafe_allow_html=True)
 
-def format_time_24h(time):
-    """Format time in 24h format"""
-    return time.strftime("%H:%M")
+def format_time(dt, format_12h=False):
+    """Format time in either 24h or 12h format"""
+    if format_12h:
+        return dt.strftime("%I:%M %p").lstrip("0")
+    return dt.strftime("%H:%M")
 
-def format_time_12h(time):
-    """Format time in 12h format"""
-    return time.strftime("%I:%M %p")
+def create_time_slots():
+    """Create 30-minute time slots from 8 AM to 8 PM"""
+    slots = []
+    start = datetime.strptime("08:00", "%H:%M")
+    end = datetime.strptime("20:00", "%H:%M")
+    current = start
+    while current <= end:
+        slots.append(current)
+        current += timedelta(minutes=30)
+    return slots
 
-def create_weekly_calendar(schedule_df):
-    # Calendar header with navigation
-    col1, col2, col3, col4, col5 = st.columns([1, 3, 8, 3, 1])
-    
+def is_current_time_slot(time_slot, day):
+    """Check if this is the current time slot"""
+    now = datetime.now()
+    return (now.strftime("%A").upper()[:3] == day and 
+            time_slot.hour == now.hour and 
+            time_slot.minute <= now.minute < time_slot.minute + 30)
+
+def handle_slot_click(day, time_slot):
+    """Handle click on a time slot"""
+    st.session_state.selected_slot = {
+        'day': day,
+        'time': time_slot
+    }
+
+def create_calendar():
+    """Create the calendar grid"""
+    # Navigation
+    col1, col2, col3, col4, col5 = st.columns([1, 2, 6, 2, 1])
     with col1:
         if st.button("←"):
             st.session_state.current_week -= timedelta(days=7)
-    
     with col2:
-        st.button("Today", key="today_button", 
-                 on_click=lambda: setattr(st.session_state, 'current_week', datetime.now()))
-    
+        if st.button("Today"):
+            st.session_state.current_week = datetime.now()
     with col3:
         start_date = st.session_state.current_week - timedelta(days=st.session_state.current_week.weekday())
-        end_date = start_date + timedelta(days=6)
         st.markdown(f"### {start_date.strftime('%B %Y')}")
-    
-    with col4:
-        st.selectbox("View", ["Week", "Month", "Year"], key="view_selector")
-    
     with col5:
         if st.button("→"):
             st.session_state.current_week += timedelta(days=7)
 
-    # Create the calendar grid
-    week_days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT']
-    dates = [(start_date + timedelta(days=i)).day for i in range(7)]
+    # Calendar grid
+    week_days = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
+    dates = [(start_date + timedelta(days=i)) for i in range(7)]
     
     # Day headers
-    cols = st.columns([0.8] + [1] * 7)
-    with cols[0]:
-        st.write("")  # Empty space for time column
+    st.markdown('<div class="calendar-grid">', unsafe_allow_html=True)
+    st.markdown('<div class="time-column"></div>', unsafe_allow_html=True)
     for i, (day, date) in enumerate(zip(week_days, dates)):
-        with cols[i + 1]:
-            st.markdown(f"**{day}**\n{date}", unsafe_allow_html=True)
+        is_current = date.date() == datetime.now().date()
+        st.markdown(
+            f'<div class="day-header {"current-day" if is_current else ""}">'
+            f'{day}<br>{date.strftime("%d")}</div>',
+            unsafe_allow_html=True
+        )
     
     # Time slots and events
-    for hour in range(24):
-        time_slot = datetime.strptime(f"{hour:02d}:00", "%H:%M")
-        cols = st.columns([0.8] + [1] * 7)
-        
+    time_slots = create_time_slots()
+    for time_slot in time_slots:
         # Time column
-        with cols[0]:
-            st.markdown(f"""
-            <div class="time-column">
-                {format_time_24h(time_slot)}<br>
-                <small>{format_time_12h(time_slot)}</small>
-            </div>
-            """, unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="time-column">{format_time(time_slot)}</div>',
+            unsafe_allow_html=True
+        )
         
-        # Event columns
-        for day_idx, day in enumerate(week_days):
-            with cols[day_idx + 1]:
-                day_events = schedule_df[
-                    (schedule_df['Day'] == day) & 
-                    (pd.to_datetime(schedule_df['Start Time']).dt.hour <= hour) & 
-                    (pd.to_datetime(schedule_df['End Time']).dt.hour > hour)
-                ]
-                
-                for _, event in day_events.iterrows():
-                    color = event.get('Color', '#1a73e8')  # Default blue color
-                    st.markdown(f"""
-                    <div class="event-block" style="background-color: {color}">
-                        {event['Task']}<br>
-                        <small>{event['Start Time']} - {event['End Time']}</small>
-                    </div>
-                    """, unsafe_allow_html=True)
+        # Day columns
+        for day in week_days:
+            events = [e for e in st.session_state.events 
+                     if e['day'] == day and 
+                     datetime.strptime(e['start_time'], "%H:%M") <= time_slot < 
+                     datetime.strptime(e['end_time'], "%H:%M")]
+            
+            slot_html = f'<div class="time-slot" onclick="handle_slot_click(\'{day}\', \'{format_time(time_slot)}\')">'
 
-# Chat interface in a sidebar
-with st.sidebar:
-    st.subheader("Chat with your Assistant")
+            # Current time indicator
+            if is_current_time_slot(time_slot, day):
+                slot_html += '<div class="current-time"></div>'
+            
+            # Events
+            for event in events:
+                slot_html += f"""
+                <div class="event-block" style="background-color: {event.get('color', '#1a73e8')}">
+                    {event['title']}<br>
+                    <small>{event['start_time']} - {event['end_time']}</small>
+                </div>
+                """
+            
+            slot_html += '</div>'
+            st.markdown(slot_html, unsafe_allow_html=True)
     
-    # Display chat messages
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# Main layout - Two columns
+col1, col2 = st.columns([1, 2])
+
+# Left column - Chat interface
+with col1:
+    # Chat container
+    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+    
+    # Messages area
+    st.markdown('<div class="chat-messages">', unsafe_allow_html=True)
+    
+    # Display messages
     for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
+        message_class = "user-message" if message["role"] == "user" else "assistant-message"
+        st.markdown(
+            f'<div class="message {message_class}">{message["content"]}</div>',
+            unsafe_allow_html=True
+        )
     
-    # Chat input
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Input area
+    st.markdown('<div class="chat-input">', unsafe_allow_html=True)
     if prompt := st.chat_input("What would you like to schedule?"):
+        # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         
-        with st.chat_message("user"):
-            st.write(prompt)
+        # Get assistant response
+        chat_response = model.generate_content(f"""
+        You are a helpful scheduling assistant. The user said: "{prompt}"
+        Current schedule: {json.dumps(st.session_state.events)}
+        Please provide a helpful response and suggest any schedule changes.
+        """)
         
-        with st.chat_message("assistant"):
-            schedule_response = st.session_state.scheduler.generate_schedule(prompt)
-            chat_response = model.generate_content(f"""
-            You are a helpful scheduling assistant. The user said: "{prompt}"
-            Current schedule: {st.session_state.schedule.to_json()}
-            Scheduling response: {schedule_response}
-            """)
-            
-            if isinstance(schedule_response, pd.DataFrame):
-                st.session_state.schedule = schedule_response
-            
-            st.write(chat_response.candidates[0].content.parts[0].text)
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": chat_response.candidates[0].content.parts[0].text
-            })
+        # Add assistant response
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": chat_response.candidates[0].content.parts[0].text
+        })
+        
+        # Rerun to update chat
+        st.rerun()
+    
+    st.markdown('</div></div>', unsafe_allow_html=True)
 
-# Main calendar view
-st.markdown("## Schedule")
-create_weekly_calendar(st.session_state.schedule)
-
-# Add task form in an expander
-with st.expander("Add New Task"):
-    with st.form("add_task"):
-        task_name = st.text_input("Task Name")
-        col1, col2 = st.columns(2)
-        with col1:
-            day = st.selectbox("Day", ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'])
-            start_time = st.time_input("Start Time")
-        with col2:
-            color = st.color_picker("Color", "#1a73e8")
-            end_time = st.time_input("End Time")
-        
-        priority = st.selectbox("Priority", ["High", "Medium", "Low"])
-        restrictions = st.text_area("Restrictions")
-        submitted = st.form_submit_button("Add Task")
-        
-        if submitted:
-            restrictions_dict = {"restrictions": restrictions} if restrictions else {}
-            conflicts = st.session_state.scheduler.add_task(
-                task_name=task_name,
-                start_time=start_time.strftime('%H:%M'),
-                end_time=end_time.strftime('%H:%M'),
-                priority=priority,
-                restrictions=restrictions_dict,
-                day=day,
-                color=color
-            )
-            
-            if conflicts:
-                st.warning(f"Warning: Scheduling conflicts detected: {conflicts}")
-            else:
-                st.success("Task added successfully!")
-            
-            st.session_state.schedule = st.session_state.scheduler.get_schedule() 
+# Right column - Calendar
+with col2:
+    st.title("Calendar")
+    create_calendar()
