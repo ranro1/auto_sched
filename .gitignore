@@ -2,3 +2,4 @@
 *.csv
 credentials.json
 *.pickle
+*.pyc
