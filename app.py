@@ -5,9 +5,17 @@ import pandas as pd
 import json
 import os
 from dotenv import load_dotenv
-from scheduler import Scheduler
 from google_calendar import get_google_calendar_service, add_event_to_calendar, get_week_events, convert_to_dataframe
 import time
+
+
+# Load environment variables
+load_dotenv()
+
+# Configure Gemini
+genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+model = genai.GenerativeModel('gemini-1.5-flash')
+
 
 def parse_natural_language(prompt):
     """Use Gemini to parse natural language into structured event details."""
@@ -138,195 +146,244 @@ def schedule_event(event_details):
     except Exception as e:
         raise Exception(f"Error scheduling event: {str(e)}")
 
-# Load environment variables
-load_dotenv()
+def parse_schedule_prompt(prompt):
+    """Parse the scheduling prompt to extract event details."""
+    import re
+    
+    # Default values
+    task_name = "Meeting"
+    day = None
+    time_str = None
+    duration = 30
+    
+    # Extract task name
+    task_match = re.search(r'([^0-9]+)(?:\s+on|\s+at|\s+for)', prompt, re.IGNORECASE)
+    if task_match:
+        task_name = task_match.group(1).strip()
+    
+    # Extract day
+    day_match = re.search(r'(?:on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)', prompt, re.IGNORECASE)
+    if day_match:
+        day = day_match.group(1).upper()[:3]
+    
+    # Extract time
+    time_match = re.search(r'at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)', prompt, re.IGNORECASE)
+    if time_match:
+        time_str = time_match.group(1)
+    
+    # Extract duration
+    duration_match = re.search(r'for\s+(\d+)\s*(?:min|minutes|mins|hour|hours|hr|hrs)', prompt, re.IGNORECASE)
+    if duration_match:
+        duration = int(duration_match.group(1))
+    
+    return task_name, day, time_str, duration
 
-# Configure Gemini
-genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-model = genai.GenerativeModel('gemini-1.5-flash')
 
 # Initialize Google Calendar service
 if 'calendar_service' not in st.session_state:
     try:
         st.session_state.calendar_service = get_google_calendar_service()
-        st.success("Successfully connected to Google Calendar!")
     except Exception as e:
-        st.error(f"Failed to connect to Google Calendar: {str(e)}")
         st.error("Please set up Google Calendar credentials. See README for instructions.")
         st.stop()
 
-# Initialize session state
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-if 'last_prompt' not in st.session_state:
-    st.session_state.last_prompt = None
+# Set page config
+st.set_page_config(layout="wide", page_title="My Private Scheduler")
 
-# Custom CSS for enhanced UI
+# Custom CSS for styling
 st.markdown("""
 <style>
-    .stApp {
-        background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
-        color: #ffffff;
-        padding: 0 !important;
-        margin: 0 !important;
-    }
-    
-    .main-container {
-        display: flex;
-        flex-direction: row;
-        align-items: stretch;
-        padding: 0;
-        margin: 0;
-        min-height: 100vh;
-    }
-    
-    .chat-container {
-        flex: 1;
-        max-width: 400px;
-        background: rgba(45, 45, 45, 0.8);
-        padding: 1rem;
-    }
-    
-    .calendar-container {
-        flex: 3;
-        background: rgba(45, 45, 45, 0.8);
-    }
-    
+    /* Calendar styling */
     .calendar-iframe {
         width: 100%;
-        height: 100vh;
+        height: calc(100vh - 100px);
+        min-height: 800px;
         border: none;
+        margin-top: 10px;
     }
     
-    .messages-container {
-        height: calc(100vh - 200px);
+    /* Chat layout styling */
+    .chat-container {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        position: relative;
+    }
+    
+    .chat-title {
+        padding: 15px;
+        font-size: 24px;
+        font-weight: bold;
+        border-bottom: 1px solid #eee;
+    }
+    
+    .chat-messages-container {
+        flex: 1;
         overflow-y: auto;
-        padding: 1rem;
+        padding: 15px;
+        margin-bottom: 80px; /* Space for the input */
     }
     
-    .chat-message {
-        background-color: rgba(45, 45, 45, 0.8);
-        border-radius: 12px;
-        padding: 1rem;
-        margin: 0.5rem 0;
-        max-width: 85%;
+    .chat-input-container {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        background-color: white;
+        padding: 15px;
+        border-top: 1px solid #eee;
+        z-index: 100;
     }
     
-    .chat-message.user {
-        background: linear-gradient(135deg, #1a73e8 0%, #0d47a1 100%);
-        margin-left: auto;
-    }
-    
-    .chat-message.assistant {
-        background: rgba(45, 45, 45, 0.8);
-        margin-right: auto;
-    }
-    
-    .stTextInput > div > div > input {
-        background-color: rgba(45, 45, 45, 0.8);
-        color: white;
-        border-radius: 12px;
+    /* Message styling */
+    .message {
+        max-width: 80%;
         padding: 12px 16px;
+        border-radius: 15px;
+        margin: 5px 0;
+        font-size: 16px;
+        line-height: 1.4;
     }
     
-    h1 {
-        color: white;
-        margin: 0 !important;
-        padding: 0 !important;
-        font-size: 1.8rem !important;
+    .user-message {
+        background-color: #e3f2fd;
+        color: black;
+        margin-left: auto;
+        margin-right: 0;
+        border-bottom-right-radius: 5px;
+        text-align: right;
+    }
+    
+    .assistant-message {
+        background-color: #f5f5f5;
+        color: black;
+        margin-right: auto;
+        margin-left: 0;
+        border-bottom-left-radius: 5px;
+        text-align: left;
+    }
+    
+    /* Hide streamlit branding */
+    #MainMenu, footer, header {
+        visibility: hidden;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Main container
-st.markdown('<div class="main-container">', unsafe_allow_html=True)
 
-# Chat section
-st.markdown('<div class="chat-container">', unsafe_allow_html=True)
-st.title("Schedule Assistant")
+# Initialize session state for chat history
+if 'messages' not in st.session_state:
+    st.session_state.messages = [
+        {"role": "assistant", "content": "Hello! I'm your private scheduler. How can I help you plan your time today?"}
+    ]
 
-# Messages container
-st.markdown('<div class="messages-container">', unsafe_allow_html=True)
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
-st.markdown('</div>', unsafe_allow_html=True)
 
-# Chat input
-if prompt := st.chat_input("What would you like to schedule?"):
-    if prompt != st.session_state.last_prompt:
-        st.session_state.last_prompt = prompt
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        with st.chat_message("user"):
-            st.write(prompt)
-        
-        with st.chat_message("assistant"):
+# Initialize last_prompt to avoid loops
+if 'last_prompt' not in st.session_state:
+    st.session_state.last_prompt = None
+
+# Function to add a message to the chat history
+def add_message(role, content):
+    st.session_state.messages.append({"role": role, "content": content})
+
+
+# Main layout - Two columns
+col1, col2 = st.columns([1, 2])
+
+# Left column - Chat interface
+with col1:
+    
+    # Title
+    st.markdown('<div class="chat-title">Schedule Assistant</div>', unsafe_allow_html=True)
+
+    # st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+    
+    # Messages container
+    st.markdown('<div class="chat-messages-container">', unsafe_allow_html=True)
+    for message in st.session_state.messages:
+        message_class = "user-message" if message["role"] == "user" else "assistant-message"
+        st.markdown(
+            f'<div class="message {message_class}">{message["content"]}</div>',
+            unsafe_allow_html=True
+        )
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Input container
+    st.markdown('<div class="chat-input-container">', unsafe_allow_html=True)
+    if prompt := st.chat_input("What would you like to schedule?"):
+        if prompt != st.session_state.last_prompt:
+            st.session_state.last_prompt = prompt
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            
             try:
                 event_details = parse_natural_language(prompt)
                 start_datetime, end_datetime, event_link = schedule_event(event_details)
                 response = f"Scheduled {event_details['title']} on {event_details['day']} from {start_datetime.strftime('%I:%M %p')} to {end_datetime.strftime('%I:%M %p')}"
-                st.write(response)
                 st.session_state.messages.append({"role": "assistant", "content": response})
-                st.experimental_rerun()
+                st.rerun()
             except Exception as e:
                 error_msg = f"I couldn't schedule the event. Error: {str(e)}"
-                st.write(error_msg)
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
-
-st.markdown('</div>', unsafe_allow_html=True)
-
-# Calendar section
-st.markdown('<div class="calendar-container">', unsafe_allow_html=True)
-try:
-    calendar_list = st.session_state.calendar_service.calendarList().list().execute()
-    primary_calendar = next((cal for cal in calendar_list.get('items', []) if cal.get('primary')), None)
+                st.rerun()
     
-    if primary_calendar:
-        calendar_id = primary_calendar['id']
-        timestamp = int(time.time())
-        calendar_url = (
-            f"https://calendar.google.com/calendar/embed?"
-            f"src={calendar_id}&"
-            f"height=1000&"
-            f"wkst=1&"
-            f"bgcolor=%231a1a1a&"
-            f"ctz={datetime.now().astimezone().tzinfo}&"
-            f"mode=WEEK&"
-            f"showTitle=1&"
-            f"showNav=1&"
-            f"showDate=1&"
-            f"showPrint=0&"
-            f"showTabs=1&"
-            f"showCalendars=1&"
-            f"showTz=1&"
-            f"hl=en&"
-            f"t={timestamp}"
-        )
-        
-        st.markdown("""
-            <script>
-                function refreshCalendar() {
-                    const iframe = document.querySelector('.calendar-iframe');
-                    const currentSrc = iframe.src;
-                    const newSrc = currentSrc.replace(/t=\\d+/, 't=' + Math.floor(Date.now() / 1000));
-                    iframe.src = newSrc;
-                }
-                setInterval(refreshCalendar, 15000);
-            </script>
-        """, unsafe_allow_html=True)
-        
-        st.markdown(f"""
-            <iframe 
-                class="calendar-iframe"
-                src="{calendar_url}"
-                frameborder="0">
-            </iframe>
-        """, unsafe_allow_html=True)
-    else:
-        st.error("Could not find your primary calendar. Please make sure you're properly authenticated.")
-except Exception as e:
-    st.error(f"Error loading calendar: {str(e)}")
+    # st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-st.markdown('</div>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True) 
+
+
+# Right column - Google Calendar view
+with col2:
+    # Calendar section
+    st.markdown('<div class="calendar-container">', unsafe_allow_html=True)
+    try:
+        calendar_list = st.session_state.calendar_service.calendarList().list().execute()
+        primary_calendar = next((cal for cal in calendar_list.get('items', []) if cal.get('primary')), None)
+        
+        if primary_calendar:
+            calendar_id = primary_calendar['id']
+            timestamp = int(time.time())
+            calendar_url = (
+                f"https://calendar.google.com/calendar/embed?"
+                f"src={calendar_id}&"
+                f"height=1000&"
+                f"wkst=1&"
+                f"bgcolor=%231a1a1a&"
+                f"ctz={datetime.now().astimezone().tzinfo}&"
+                f"mode=WEEK&"
+                f"showTitle=1&"
+                f"showNav=1&"
+                f"showDate=1&"
+                f"showPrint=0&"
+                f"showTabs=1&"
+                f"showCalendars=1&"
+                f"showTz=1&"
+                f"hl=en&"
+                f"t={timestamp}"
+            )
+            
+            st.markdown("""
+                <script>
+                    function refreshCalendar() {
+                        const iframe = document.querySelector('.calendar-iframe');
+                        const currentSrc = iframe.src;
+                        const newSrc = currentSrc.replace(/t=\\d+/, 't=' + Math.floor(Date.now() / 1000));
+                        iframe.src = newSrc;
+                    }
+                    setInterval(refreshCalendar, 15000);
+                </script>
+            """, unsafe_allow_html=True)
+            
+            st.markdown(f"""
+                <iframe 
+                    class="calendar-iframe"
+                    src="{calendar_url}"
+                    frameborder="0">
+                </iframe>
+            """, unsafe_allow_html=True)
+        else:
+            st.error("Could not find your primary calendar. Please make sure you're properly authenticated.")
+    except Exception as e:
+        st.error(f"Error loading calendar: {str(e)}")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True) 
