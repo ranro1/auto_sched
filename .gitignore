@@ -1,2 +1,4 @@
 .env
 .csv
+credentials.json
+token.pickle

@@ -3,46 +3,34 @@ from datetime import datetime, timedelta
 import pandas as pd
 import json
 import os
+import re
 
 class Scheduler:
     def __init__(self):
-        self.model = genai.GenerativeModel('gemini-pro')
-        self.schedule = pd.DataFrame(columns=['Task', 'Start Time', 'End Time', 'Priority', 'Status', 'Day', 'Color'])
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        self.schedule = pd.DataFrame(columns=['Task', 'Start Time', 'End Time', 'Status', 'Day', 'Color'])
         self.system_prompt = """
-        You are an expert personal scheduling assistant. Your role is to help users create and manage their weekly schedules efficiently.
+        You are a scheduling assistant. Your role is to help users manage their weekly schedules.
         
-        Your capabilities include:
-        1. Understanding and processing natural language descriptions of tasks and commitments
-        2. Considering various constraints and priorities when scheduling
-        3. Detecting and resolving scheduling conflicts
-        4. Making intelligent adjustments to existing schedules
-        5. Asking relevant questions to gather necessary information
+        When scheduling tasks:
+        - Process natural language descriptions of tasks
+        - Consider time constraints
+        - Check for scheduling conflicts
+        - Format responses clearly and concisely
         
-        When scheduling, consider:
-        - Task priorities and deadlines
-        - Time restrictions and preferences
-        - Required break times between tasks
-        - Travel time if applicable
-        - Energy levels throughout the day
-        - Task dependencies and prerequisites
-        
-        Always:
-        1. Ask clarifying questions when information is missing
-        2. Suggest optimal time slots based on the user's preferences
-        3. Explain your reasoning for schedule decisions
-        4. Propose alternatives when conflicts arise
-        5. Consider the user's work-life balance
-        
-        Format your responses in a clear, structured manner, and be proactive in suggesting improvements to the schedule.
+        Keep responses brief and focused on:
+        - Task details
+        - Scheduled time
+        - Any conflicts
+        - Missing essential information
         """
     
-    def add_task(self, task_name, start_time, end_time, priority, restrictions=None, day=None, color=None):
+    def add_task(self, task_name, start_time, end_time, restrictions=None, day=None, color=None):
         """Add a new task to the schedule"""
         new_task = pd.DataFrame({
             'Task': [task_name],
             'Start Time': [start_time],
             'End Time': [end_time],
-            'Priority': [priority],
             'Status': ['Pending'],
             'Restrictions': [restrictions or {}],
             'Day': [day],
@@ -98,7 +86,13 @@ class Scheduler:
         """
         
         response = self.model.generate_content(prompt)
-        return self._parse_schedule_response(response.candidates[0].content.parts[0].text)
+        new_schedule = self._parse_schedule_response(response.candidates[0].content.parts[0].text)
+        
+        if isinstance(new_schedule, pd.DataFrame):
+            # Update the internal schedule state
+            self.schedule = new_schedule
+            
+        return new_schedule
     
     def _parse_schedule_response(self, response_text):
         """Parse Gemini's response into a structured schedule"""
@@ -111,9 +105,39 @@ class Scheduler:
             df['Start Time'] = pd.to_datetime(df['Start Time']).dt.strftime('%H:%M')
             df['End Time'] = pd.to_datetime(df['End Time']).dt.strftime('%H:%M')
             
+            # Ensure all required columns exist
+            required_columns = ['Task', 'Start Time', 'End Time', 'Status', 'Day', 'Color']
+            for col in required_columns:
+                if col not in df.columns:
+                    if col == 'Status':
+                        df[col] = 'Pending'
+                    elif col == 'Color':
+                        df[col] = '#1a73e8'
+            
             return df
         except:
-            # If parsing fails, return the raw response
+            # If parsing fails, try to create a new task from the response
+            try:
+                # Extract task details using regex
+                task_match = re.search(r'Task:\s*(.*?)(?:\n|$)', response_text)
+                day_match = re.search(r'Day:\s*(.*?)(?:\n|$)', response_text)
+                start_match = re.search(r'Start Time:\s*(.*?)(?:\n|$)', response_text)
+                end_match = re.search(r'End Time:\s*(.*?)(?:\n|$)', response_text)
+                
+                if all([task_match, day_match, start_match, end_match]):
+                    new_task = pd.DataFrame({
+                        'Task': [task_match.group(1)],
+                        'Day': [day_match.group(1)],
+                        'Start Time': [start_match.group(1)],
+                        'End Time': [end_match.group(1)],
+                        'Status': ['Pending'],
+                        'Color': ['#1a73e8']
+                    })
+                    return new_task
+            except:
+                pass
+            
+            # If all parsing fails, return the raw response
             return response_text
     
     def adjust_schedule(self, task_name, new_requirements):
