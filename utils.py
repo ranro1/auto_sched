@@ -1,19 +1,11 @@
 import json
+import re
 from datetime import datetime, timedelta
 import google.generativeai as genai
 import os
-from dotenv import load_dotenv
-from google_calendar import get_google_calendar_service, add_event_to_calendar
-import streamlit as st
+from google_calendar import add_event_to_calendar
 
-# Load environment variables
-load_dotenv()
-
-# Configure Gemini
-genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-model = genai.GenerativeModel('gemini-1.5-flash')
-
-def parse_natural_language(prompt):
+def parse_natural_language(prompt, model):
     """Use Gemini to parse natural language into structured event details."""
     try:
         # Create a prompt for Gemini to extract event details
@@ -141,6 +133,36 @@ def schedule_event(event_details, calendar_service):
         return start_datetime, end_datetime, event_link
     except Exception as e:
         raise Exception(f"Error scheduling event: {str(e)}")
+
+def parse_schedule_prompt(prompt):
+    """Parse the scheduling prompt to extract event details."""
+    # Default values
+    task_name = "Meeting"
+    day = None
+    time_str = None
+    duration = 30
+    
+    # Extract task name
+    task_match = re.search(r'([^0-9]+)(?:\s+on|\s+at|\s+for)', prompt, re.IGNORECASE)
+    if task_match:
+        task_name = task_match.group(1).strip()
+    
+    # Extract day
+    day_match = re.search(r'(?:on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)', prompt, re.IGNORECASE)
+    if day_match:
+        day = day_match.group(1).upper()[:3]
+    
+    # Extract time
+    time_match = re.search(r'at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)', prompt, re.IGNORECASE)
+    if time_match:
+        time_str = time_match.group(1)
+    
+    # Extract duration
+    duration_match = re.search(r'for\s+(\d+)\s*(?:min|minutes|mins|hour|hours|hr|hrs)', prompt, re.IGNORECASE)
+    if duration_match:
+        duration = int(duration_match.group(1))
+    
+    return task_name, day, time_str, duration
 
 def add_message(role, content):
     """Add a message to the chat history."""
