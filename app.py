@@ -7,7 +7,7 @@ import os
 from dotenv import load_dotenv
 from google_calendar import get_google_calendar_service
 import time
-from utils import parse_natural_language, schedule_event, parse_schedule_prompt
+from utils import parse_natural_language, handle_calendar_action
 
 
 # Load environment variables
@@ -36,7 +36,7 @@ with open('style.css') as f:
 # Initialize session state for chat history
 if 'messages' not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hello! I'm your private scheduler. How can I help you plan your time today?"}
+        {"role": "assistant", "content": "Hello! I'm your friendly calendar assistant. How can I help you manage your schedule today?"}
     ]
 
 
@@ -72,19 +72,29 @@ with col1:
     
     # Input container
     st.markdown('<div class="chat-input-container">', unsafe_allow_html=True)
-    if prompt := st.chat_input("What would you like to schedule?"):
+    if prompt := st.chat_input("What would you like to do with your calendar?"):
         if prompt != st.session_state.last_prompt:
             st.session_state.last_prompt = prompt
             st.session_state.messages.append({"role": "user", "content": prompt})
             
             try:
                 event_details = parse_natural_language(prompt, model)
-                start_datetime, end_datetime, event_link = schedule_event(event_details, st.session_state.calendar_service)
-                response = f"Scheduled {event_details['title']} on {event_details['day']} from {start_datetime.strftime('%I:%M %p')} to {end_datetime.strftime('%I:%M %p')}"
+                start_datetime, end_datetime, event_link, clarification = handle_calendar_action(event_details, st.session_state.calendar_service)
+                
+                if clarification:
+                    response = clarification
+                else:
+                    if event_details['action'] == 'CREATE':
+                        response = f"Scheduled {event_details['title']} on {event_details['day']} from {start_datetime.strftime('%I:%M %p')} to {end_datetime.strftime('%I:%M %p')}"
+                    elif event_details['action'] == 'EDIT':
+                        response = f"Updated event: {event_details['original_title']} -> {event_details.get('new_title', event_details['original_title'])}"
+                    elif event_details['action'] == 'DELETE':
+                        response = f"Deleted event: {event_details['original_title']}"
+                
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 st.rerun()
             except Exception as e:
-                error_msg = f"I couldn't schedule the event. Error: {str(e)}"
+                error_msg = f"I couldn't complete your request. Error: {str(e)}"
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
                 st.rerun()
     
