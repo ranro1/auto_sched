@@ -132,10 +132,12 @@ def schedule_event(event_details, calendar_service):
         event_link = add_event_to_calendar(calendar_service, event_data)
         return start_datetime, end_datetime, event_link
     except Exception as e:
-        raise Exception(f"Error scheduling event: {str(e)}")
-
+        raise Exception(f"Error scheduling event: {str(e)}") 
+    
 def parse_schedule_prompt(prompt):
     """Parse the scheduling prompt to extract event details."""
+    import re
+    
     # Default values
     task_name = "Meeting"
     day = None
@@ -163,7 +165,3 @@ def parse_schedule_prompt(prompt):
         duration = int(duration_match.group(1))
     
     return task_name, day, time_str, duration
-
-def add_message(role, content):
-    """Add a message to the chat history."""
-    st.session_state.messages.append({"role": role, "content": content}) 
