@@ -119,10 +119,21 @@ def format_event_details(events):
     
     details = "I found the following matching events:\n\n"
     for i, event in enumerate(events, 1):
+        # Convert duration to hours and minutes
+        hours = event['duration'] // 60
+        minutes = event['duration'] % 60
+        duration_str = ""
+        if hours > 0:
+            duration_str += f"{hours} hour{'s' if hours != 1 else ''}"
+        if minutes > 0:
+            if duration_str:
+                duration_str += " and "
+            duration_str += f"{minutes} minute{'s' if minutes != 1 else ''}"
+        
         details += f"{i}. {event['title']}\n"
         details += f"   Date: {event['start'].strftime('%A, %B %d, %Y')}\n"
         details += f"   Time: {event['start'].strftime('%I:%M %p')} to {event['end'].strftime('%I:%M %p')}\n"
-        details += f"   Duration: {event['duration']} minutes\n\n"
+        details += f"   Duration: {duration_str}\n\n"
     
     return details
 
