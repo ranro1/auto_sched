@@ -85,16 +85,18 @@ with col1:
                     response = clarification
                 else:
                     if event_details['action'] == 'CREATE':
-                        response = f"Scheduled {event_details['title']} on {event_details['day']} from {start_datetime.strftime('%I:%M %p')} to {end_datetime.strftime('%I:%M %p')}"
+                        response = f"I've scheduled {event_details['title']} on {event_details['day']} from {start_datetime.strftime('%I:%M %p')} to {end_datetime.strftime('%I:%M %p')}. Is there anything else you'd like me to help you with?"
                     elif event_details['action'] == 'EDIT':
-                        response = f"Updated event: {event_details['original_title']} -> {event_details.get('new_title', event_details['original_title'])}"
+                        response = f"I've updated your event: {event_details['original_title']} -> {event_details.get('new_title', event_details['original_title'])}. Is there anything else you'd like me to help you with?"
                     elif event_details['action'] == 'DELETE':
-                        response = f"Deleted event: {event_details['original_title']}"
+                        response = f"I've deleted the event: {event_details['original_title']}. Is there anything else you'd like me to help you with?"
+                    elif event_details['action'] == 'VIEW':
+                        response = clarification  # The events list is already formatted in handle_calendar_action
                 
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 st.rerun()
             except Exception as e:
-                error_msg = f"I couldn't complete your request. Error: {str(e)}"
+                error_msg = f"I'm having trouble understanding your request. Could you please rephrase it? Error: {str(e)}"
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
                 st.rerun()
     
