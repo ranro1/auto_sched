@@ -7,7 +7,7 @@ import os
 from dotenv import load_dotenv
 from google_calendar import get_google_calendar_service
 import time
-from utils import parse_natural_language, handle_calendar_action
+from utils import parse_natural_language, handle_calendar_action, process_calendar_request
 
 
 # Load environment variables
@@ -78,27 +78,20 @@ with col1:
             st.session_state.messages.append({"role": "user", "content": prompt})
             
             try:
-                event_details = parse_natural_language(prompt, model)
-                start_datetime, end_datetime, event_link, clarification = handle_calendar_action(event_details, st.session_state.calendar_service)
+                # Process the calendar request using the new function
+                success, response = process_calendar_request(prompt, model, st.session_state.calendar_service)
                 
-                if clarification:
-                    response = clarification
-                else:
-                    if event_details['action'] == 'CREATE':
-                        response = f"Scheduled {event_details['title']} on {event_details['day']} from {start_datetime.strftime('%I:%M %p')} to {end_datetime.strftime('%I:%M %p')}"
-                    elif event_details['action'] == 'EDIT':
-                        response = f"Updated event: {event_details['original_title']} -> {event_details.get('new_title', event_details['original_title'])}"
-                    elif event_details['action'] == 'DELETE':
-                        response = f"Deleted event: {event_details['original_title']}"
-                
+                # Add the response to the chat history
                 st.session_state.messages.append({"role": "assistant", "content": response})
-                st.rerun()
+                
+                # Only refresh if the request was successful and it was a calendar action
+                if success:
+                    st.rerun()
             except Exception as e:
-                error_msg = f"I couldn't complete your request. Error: {str(e)}"
+                error_msg = f"I'm having trouble understanding your request. Could you please rephrase it? Error: {str(e)}"
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
                 st.rerun()
     
-    # st.markdown('</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 
