@@ -1027,11 +1027,15 @@ def schedule_event(event_details, calendar_service):
         
         time_slot_manager = schedule_event.time_slot_manager
         
+        # Get user's timezone (default to America/New_York if not set)
+        user_timezone = pytz.timezone('America/New_York')
+        
         # Get the event's date and time
         if 'date' in event_details:
             event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
+            event_date = user_timezone.localize(event_date)
         else:
-            today = datetime.now()
+            today = datetime.now(user_timezone)
             days_ahead = 0
             while True:
                 current_date = today + timedelta(days=days_ahead)
@@ -1054,7 +1058,7 @@ def schedule_event(event_details, calendar_service):
         elif period == 'AM' and hour == 12:
             hour = 0
         
-        # Create datetime object for preferred start time
+        # Create datetime object for preferred start time in user's timezone
         preferred_start = event_date.replace(hour=hour, minute=minute)
         
         # Calculate total duration including travel time
@@ -1097,15 +1101,20 @@ def schedule_event(event_details, calendar_service):
         # Calculate end time
         end_time = start_time + timedelta(minutes=total_duration)
         
+        # Convert times to UTC for Google Calendar
+        utc = pytz.UTC
+        start_time_utc = start_time.astimezone(utc)
+        end_time_utc = end_time.astimezone(utc)
+        
         # Create event in Google Calendar
         event = {
             'summary': event_details['title'],
             'start': {
-                'dateTime': start_time.isoformat(),
+                'dateTime': start_time_utc.isoformat(),
                 'timeZone': 'UTC',
             },
             'end': {
-                'dateTime': end_time.isoformat(),
+                'dateTime': end_time_utc.isoformat(),
                 'timeZone': 'UTC',
             },
             'description': f"Duration: {duration} minutes" + \
@@ -1118,7 +1127,7 @@ def schedule_event(event_details, calendar_service):
         
         created_event = calendar_service.events().insert(calendarId='primary', body=event).execute()
         
-        # Add the time slot to the manager
+        # Add the time slot to the manager (using local time)
         time_slot_manager.add_time_slot(
             event_date.date(),
             start_time,
