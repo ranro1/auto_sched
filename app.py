@@ -54,24 +54,19 @@ col1, col2 = st.columns([1, 2])
 
 # Left column - Chat interface
 with col1:
-    
     # Title
     st.markdown('<div class="chat-title">Donna</div>', unsafe_allow_html=True)
 
-    # st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+    # Create a container for chat messages with fixed height
+    chat_container = st.container(height=700)  # Using a larger pixel value to fill most of the screen
     
-    # Messages container
-    st.markdown('<div class="chat-messages-container">', unsafe_allow_html=True)
-    for message in st.session_state.messages:
-        message_class = "user-message" if message["role"] == "user" else "assistant-message"
-        st.markdown(
-            f'<div class="message {message_class}">{message["content"]}</div>',
-            unsafe_allow_html=True
-        )
-    st.markdown('</div>', unsafe_allow_html=True)
+    # Display chat history in the container
+    with chat_container:
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
     
-    # Input container
-    st.markdown('<div class="chat-input-container">', unsafe_allow_html=True)
+    # Chat input at the bottom
     if prompt := st.chat_input("What would you like to do with your calendar?"):
         if prompt != st.session_state.last_prompt:
             st.session_state.last_prompt = prompt
@@ -91,9 +86,6 @@ with col1:
                 error_msg = f"I'm having trouble understanding your request. Could you please rephrase it? Error: {str(e)}"
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
                 st.rerun()
-    
-    st.markdown('</div>', unsafe_allow_html=True)
-
 
 
 # Right column - Google Calendar view

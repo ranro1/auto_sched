@@ -8,10 +8,11 @@
 /* Calendar styling */
 .calendar-iframe {
     width: 100%;
-    height: calc(100vh - 100px);
-    min-height: 800px;
+    /* height: 100%; */
+    min-height: 750px;
     border: none;
-    margin-top: 10px;
+    margin-top: 0px;
+    margin-bottom: 0px;
 }
 
 /* Chat layout styling */
