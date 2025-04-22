@@ -23,7 +23,7 @@
 }
 
 .chat-title {
-    padding: 15px;
+    padding: 0px;
     font-size: 24px;
     font-weight: bold;
     border-bottom: 1px solid #eee;
@@ -35,7 +35,7 @@
     padding: 15px;
     margin-bottom: 80px; /* Space for the input */
 }
-
+/* 
 .chat-input-container {
     position: fixed;
     bottom: 0;
@@ -45,7 +45,7 @@
     padding: 15px;
     border-top: 1px solid #eee;
     z-index: 100;
-}
+} */
 
 /* Message styling */
 .message {

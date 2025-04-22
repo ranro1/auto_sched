@@ -27,7 +27,7 @@ if 'calendar_service' not in st.session_state:
         st.stop()
 
 # Set page config
-st.set_page_config(layout="wide", page_title="My Private Scheduler")
+st.set_page_config(layout="wide", page_title="Donna")
 
 # Load external CSS
 with open('style.css') as f:
@@ -36,7 +36,7 @@ with open('style.css') as f:
 # Initialize session state for chat history
 if 'messages' not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hello! I'm your friendly calendar assistant. How can I help you manage your schedule today?"}
+        {"role": "assistant", "content": "Hello! I'm Donna, your friendly calendar assistant. How can I help you manage your schedule today?"}
     ]
 
 
@@ -56,7 +56,7 @@ col1, col2 = st.columns([1, 2])
 with col1:
     
     # Title
-    st.markdown('<div class="chat-title">Schedule Assistant</div>', unsafe_allow_html=True)
+    st.markdown('<div class="chat-title">Donna</div>', unsafe_allow_html=True)
 
     # st.markdown('<div class="chat-container">', unsafe_allow_html=True)
     
