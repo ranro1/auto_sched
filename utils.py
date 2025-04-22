@@ -765,6 +765,7 @@ Your task is to:
    - Duration
    - Travel time (if mentioned)
    - Any dependencies or constraints
+   - Time constraints (e.g., "between 8 AM and 8:30 AM")
 3. Format each event as a separate JSON object
 4. Ensure no time conflicts between events
 
@@ -778,6 +779,7 @@ For each event, extract:
 - travel_time: travel duration in minutes if mentioned
 - recurring: true/false if it's a daily/weekly event
 - constraints: any specific constraints mentioned
+- time_constraints: min/max time if specified (e.g., "between 8 AM and 8:30 AM")
 
 IMPORTANT: Your response must be a valid JSON array of events. Do not include any explanatory text.
 Each event must have at least title, time, and duration.
@@ -797,7 +799,11 @@ Example output format:
         "title": "Workout",
         "recurring": true,
         "time": "06:00 AM",
-        "duration": 60
+        "duration": 60,
+        "time_constraints": {
+            "min": {"hour": 6, "minute": 0},
+            "max": {"hour": 6, "minute": 0}
+        }
     }
 ]
 
@@ -907,18 +913,124 @@ def process_calendar_request(user_text, gemini_model, calendar_service):
     except Exception as e:
         return False, f"Something unexpected happened. Please try again with a simpler request. Error details: {str(e)}"
 
+class TimeSlot:
+    """Represents a time slot for an event."""
+    def __init__(self, start_time, end_time, event_id=None):
+        self.start_time = start_time
+        self.end_time = end_time
+        self.event_id = event_id
+
+    def overlaps(self, other):
+        """Check if this time slot overlaps with another."""
+        return (self.start_time < other.end_time and 
+                self.end_time > other.start_time)
+
+class TimeSlotManager:
+    """Manages time slots to prevent scheduling conflicts."""
+    def __init__(self):
+        self.time_slots = {}  # {date: [TimeSlot, ...]}
+        self.event_priorities = {
+            'class': 1,  # Highest priority
+            'meeting': 1,
+            'social': 2,
+            'study': 3,
+            'workout': 4,
+            'call': 4,
+            'default': 5  # Lowest priority
+        }
+
+    def get_event_priority(self, event_title):
+        """Determine priority of an event based on its title."""
+        title_lower = event_title.lower()
+        for key, priority in self.event_priorities.items():
+            if key in title_lower:
+                return priority
+        return self.event_priorities['default']
+
+    def add_time_slot(self, date, start_time, end_time, event_id):
+        """Add a time slot if it doesn't conflict with existing slots."""
+        if date not in self.time_slots:
+            self.time_slots[date] = []
+        
+        new_slot = TimeSlot(start_time, end_time, event_id)
+        
+        # Check for conflicts
+        for existing_slot in self.time_slots[date]:
+            if new_slot.overlaps(existing_slot):
+                return False
+        
+        self.time_slots[date].append(new_slot)
+        return True
+
+    def find_available_slot(self, date, duration, preferred_start=None, 
+                          min_time=None, max_time=None):
+        """Find an available time slot that meets the constraints."""
+        if date not in self.time_slots:
+            self.time_slots[date] = []
+        
+        # Sort existing slots by start time
+        existing_slots = sorted(self.time_slots[date], key=lambda x: x.start_time)
+        
+        # If no existing slots, return preferred time if within constraints
+        if not existing_slots:
+            if preferred_start:
+                if (not min_time or preferred_start >= min_time) and \
+                   (not max_time or preferred_start + timedelta(minutes=duration) <= max_time):
+                    return preferred_start
+            return min_time if min_time else datetime.now().replace(hour=0, minute=0)
+        
+        # First try to use preferred time if it's available
+        if preferred_start:
+            preferred_end = preferred_start + timedelta(minutes=duration)
+            if (not min_time or preferred_start >= min_time) and \
+               (not max_time or preferred_end <= max_time):
+                # Check if preferred time conflicts with existing slots
+                preferred_slot = TimeSlot(preferred_start, preferred_end)
+                has_conflict = False
+                for existing_slot in existing_slots:
+                    if preferred_slot.overlaps(existing_slot):
+                        has_conflict = True
+                        break
+                if not has_conflict:
+                    return preferred_start
+        
+        # Check gaps between existing slots
+        for i in range(len(existing_slots) - 1):
+            gap_start = existing_slots[i].end_time
+            gap_end = existing_slots[i + 1].start_time
+            gap_duration = (gap_end - gap_start).total_seconds() / 60
+            
+            if gap_duration >= duration:
+                if (not min_time or gap_start >= min_time) and \
+                   (not max_time or gap_start + timedelta(minutes=duration) <= max_time):
+                    return gap_start
+        
+        # Check after last slot
+        last_slot = existing_slots[-1]
+        if (not max_time or last_slot.end_time + timedelta(minutes=duration) <= max_time):
+            return last_slot.end_time
+        
+        # If no suitable slot found, try to find the earliest possible time
+        if min_time:
+            return min_time
+        return datetime.now().replace(hour=0, minute=0)
+
 def schedule_event(event_details, calendar_service):
     """Schedule an event with support for travel time and dependencies."""
     try:
-        # Calculate start time considering travel time
         from datetime import datetime, timedelta
         import pytz
+        
+        # Initialize time slot manager if not already done
+        if not hasattr(schedule_event, 'time_slot_manager'):
+            schedule_event.time_slot_manager = TimeSlotManager()
+        
+        time_slot_manager = schedule_event.time_slot_manager
         
         # Get the event's date and time
         if 'date' in event_details:
             event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
         else:
-            # Find next occurrence of the specified day
             today = datetime.now()
             days_ahead = 0
             while True:
@@ -942,17 +1054,48 @@ def schedule_event(event_details, calendar_service):
         elif period == 'AM' and hour == 12:
             hour = 0
         
-        # Create datetime object
-        start_time = event_date.replace(hour=hour, minute=minute)
+        # Create datetime object for preferred start time
+        preferred_start = event_date.replace(hour=hour, minute=minute)
         
-        # Adjust for travel time if specified
+        # Calculate total duration including travel time
+        duration = event_details.get('duration', 30)
         travel_time = event_details.get('travel_time', 0)
+        total_duration = duration + travel_time
+        
+        # Set time constraints if specified
+        min_time = None
+        max_time = None
+        if 'time_constraints' in event_details:
+            constraints = event_details['time_constraints']
+            if 'min' in constraints:
+                min_time = event_date.replace(
+                    hour=constraints['min']['hour'],
+                    minute=constraints['min']['minute']
+                )
+            if 'max' in constraints:
+                max_time = event_date.replace(
+                    hour=constraints['max']['hour'],
+                    minute=constraints['max']['minute']
+                )
+        
+        # Find available time slot
+        start_time = time_slot_manager.find_available_slot(
+            event_date.date(),
+            total_duration,
+            preferred_start,
+            min_time,
+            max_time
+        )
+        
+        if not start_time:
+            raise Exception("No available time slot found that meets the constraints")
+        
+        # Adjust for travel time
         if travel_time:
             start_time = start_time - timedelta(minutes=travel_time)
         
         # Calculate end time
-        duration = event_details.get('duration', 30)
-        end_time = start_time + timedelta(minutes=duration + travel_time)
+        end_time = start_time + timedelta(minutes=total_duration)
         
         # Create event in Google Calendar
         event = {
@@ -965,7 +1108,8 @@ def schedule_event(event_details, calendar_service):
                 'dateTime': end_time.isoformat(),
                 'timeZone': 'UTC',
             },
-            'description': f"Duration: {duration} minutes" + (f"\nTravel time: {travel_time} minutes" if travel_time else "")
+            'description': f"Duration: {duration} minutes" + \
+                         (f"\nTravel time: {travel_time} minutes" if travel_time else "")
         }
         
         # Add any constraints to the description
@@ -973,6 +1117,14 @@ def schedule_event(event_details, calendar_service):
             event['description'] += f"\nConstraints: {event_details['constraints']}"
         
         created_event = calendar_service.events().insert(calendarId='primary', body=event).execute()
+        
+        # Add the time slot to the manager
+        time_slot_manager.add_time_slot(
+            event_date.date(),
+            start_time,
+            end_time,
+            created_event['id']
+        )
         
         return start_time, end_time, created_event.get('htmlLink'), None
         
