@@ -968,19 +968,28 @@ class TimeSlotManager:
         if date not in self.time_slots:
             self.time_slots[date] = []
         
+        # Get current time in the same timezone
+        from datetime import datetime
+        import pytz
+        current_time = datetime.now(pytz.timezone('America/New_York'))
+        
         # Sort existing slots by start time
         existing_slots = sorted(self.time_slots[date], key=lambda x: x.start_time)
         
-        # If no existing slots, return preferred time if within constraints
+        # If no existing slots, return preferred time if within constraints and not in past
         if not existing_slots:
             if preferred_start:
-                if (not min_time or preferred_start >= min_time) and \
-                   (not max_time or preferred_start + timedelta(minutes=duration) <= max_time):
+                if (preferred_start >= current_time and
+                    (not min_time or preferred_start >= min_time) and 
+                    (not max_time or preferred_start + timedelta(minutes=duration) <= max_time)):
                     return preferred_start
-            return min_time if min_time else datetime.now().replace(hour=0, minute=0)
+            # Return min_time if it's in the future, otherwise current time
+            if min_time and min_time >= current_time:
+                return min_time
+            return current_time
         
-        # First try to use preferred time if it's available
-        if preferred_start:
+        # First try to use preferred time if it's available and not in past
+        if preferred_start and preferred_start >= current_time:
             preferred_end = preferred_start + timedelta(minutes=duration)
             if (not min_time or preferred_start >= min_time) and \
                (not max_time or preferred_end <= max_time):
@@ -998,6 +1007,11 @@ class TimeSlotManager:
         for i in range(len(existing_slots) - 1):
             gap_start = existing_slots[i].end_time
             gap_end = existing_slots[i + 1].start_time
+            
+            # Skip if gap is in the past
+            if gap_start < current_time:
+                continue
+                
             gap_duration = (gap_end - gap_start).total_seconds() / 60
             
             if gap_duration >= duration:
@@ -1005,15 +1019,16 @@ class TimeSlotManager:
                    (not max_time or gap_start + timedelta(minutes=duration) <= max_time):
                     return gap_start
         
-        # Check after last slot
+        # Check after last slot if it's in the future
         last_slot = existing_slots[-1]
-        if (not max_time or last_slot.end_time + timedelta(minutes=duration) <= max_time):
-            return last_slot.end_time
+        if last_slot.end_time >= current_time:
+            if (not max_time or last_slot.end_time + timedelta(minutes=duration) <= max_time):
+                return last_slot.end_time
         
-        # If no suitable slot found, try to find the earliest possible time
-        if min_time:
+        # If no suitable slot found, try to find the earliest possible time in the future
+        if min_time and min_time >= current_time:
             return min_time
-        return datetime.now().replace(hour=0, minute=0)
+        return current_time
 
 def schedule_event(event_details, calendar_service):
     """Schedule an event with support for travel time and dependencies."""
@@ -1029,13 +1044,24 @@ def schedule_event(event_details, calendar_service):
         
         # Get user's timezone (default to America/New_York if not set)
         user_timezone = pytz.timezone('America/New_York')
+        current_time = datetime.now(user_timezone)
         
         # Get the event's date and time
         if 'date' in event_details:
             event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
             event_date = user_timezone.localize(event_date)
+            
+            # If the date is in the past, find the next occurrence
+            if event_date < current_time:
+                days_ahead = 1
+                while True:
+                    next_date = current_time + timedelta(days=days_ahead)
+                    if next_date.date() == event_date.date():
+                        event_date = next_date
+                        break
+                    days_ahead += 1
         else:
-            today = datetime.now(user_timezone)
+            today = current_time
             days_ahead = 0
             while True:
                 current_date = today + timedelta(days=days_ahead)
@@ -1061,6 +1087,10 @@ def schedule_event(event_details, calendar_service):
         # Create datetime object for preferred start time in user's timezone
         preferred_start = event_date.replace(hour=hour, minute=minute)
         
+        # If preferred start time is in the past, move to next day
+        if preferred_start < current_time:
+            preferred_start = preferred_start + timedelta(days=1)
+        
         # Calculate total duration including travel time
         duration = event_details.get('duration', 30)
         travel_time = event_details.get('travel_time', 0)
@@ -1076,6 +1106,9 @@ def schedule_event(event_details, calendar_service):
                     hour=constraints['min']['hour'],
                     minute=constraints['min']['minute']
                 )
+                # Ensure min_time is not in the past
+                if min_time < current_time:
+                    min_time = current_time
             if 'max' in constraints:
                 max_time = event_date.replace(
                     hour=constraints['max']['hour'],
