@@ -269,7 +269,7 @@ def handle_calendar_action(event_details, calendar_service):
                 # Get the next 7 days
                 from datetime import datetime, timedelta
                 today = datetime.now()
-                events_created = 0
+                events = []
                 
                 for i in range(7):
                     current_date = today + timedelta(days=i)
@@ -286,18 +286,19 @@ def handle_calendar_action(event_details, calendar_service):
                         del event_copy['day']
                     
                     try:
-                        success, _ = schedule_event(event_copy, calendar_service)
-                        if success:
-                            events_created += 1
+                        start_time, end_time, event_link, _ = schedule_event(event_copy, calendar_service)
+                        events.append((start_time, end_time, event_link))
                     except Exception as e:
                         print(f"Warning: Failed to create recurring event for {current_date}: {str(e)}")
                         continue
                 
-                if events_created == 0:
-                    return False, "Failed to create any recurring events"
+                if not events:
+                    return None, None, None, "Failed to create any recurring events"
                 
-                # Return a simple summary message
-                return True, f"Created recurring event '{event_details['title']}' for the next 7 days at {event_details['time']}"
+                # Return the first event's details and a summary message
+                first_event = events[0]
+                summary = f"Created recurring event '{event_details['title']}' for the next 7 days"
+                return first_event[0], first_event[1], first_event[2], summary
             
             # For single events
             return schedule_event(event_details, calendar_service)
@@ -311,14 +312,14 @@ def handle_calendar_action(event_details, calendar_service):
         elif event_details['action'] == 'VIEW':
             events = get_events_for_day(calendar_service, event_details.get('day'), event_details.get('date'))
             if not events:
-                return True, "You have no events scheduled for this day."
-            return True, format_event_details(events)
+                return None, None, None, "You have no events scheduled for this day."
+            return None, None, None, format_event_details(events)
             
         elif event_details['action'] == 'UNKNOWN':
-            return False, event_details['clarification']
+            return None, None, None, event_details['clarification']
             
     except Exception as e:
-        return False, f"Error handling calendar action: {str(e)}"
+        raise Exception(f"Error handling calendar action: {str(e)}")
 
 def calculate_title_similarity(title1, title2):
     """
@@ -519,86 +520,128 @@ def parse_datetime_from_api(datetime_str, timezone_str=None):
     return dt
 
 def get_events_for_day(calendar_service, day=None, date=None):
-    """
-    Get events for a specific day or date.
-    Returns a list of events.
-    """
+    """Get events for a specific day with improved handling."""
     try:
         # Get user's timezone
         user_timezone = get_user_timezone()
         local_tz = pytz.timezone(user_timezone)
         
-        # Convert day to date if needed
-        if day and not date:
-            # Get the next occurrence of the specified day
-            today = datetime.now(local_tz)
-            days_ahead = (day_map[day.upper()] - today.weekday()) % 7
-            if days_ahead == 0:  # If today is the specified day
-                date = today.strftime('%Y-%m-%d')
-            else:
-                date = (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
-        
-        # Get events for the specified date
+        # Determine target date
         if date:
-            # Convert date string to datetime
-            start_date = datetime.strptime(date, '%Y-%m-%d')
-            start_date = local_tz.localize(start_date)
-            end_date = start_date + timedelta(days=1)
+            try:
+                # Standardize date format first
+                date = standardize_date_format(date)
+                start_date = datetime.strptime(date, '%Y-%m-%d')
+            except ValueError:
+                raise InvalidInputError("Invalid date format. Please use YYYY-MM-DD format")
+        elif day:
+            # Standardize day format
+            day = standardize_day_format(day)
             
-            # Get events from calendar
-            events_result = calendar_service.events().list(
-                calendarId='primary',
-                timeMin=start_date.isoformat(),
-                timeMax=end_date.isoformat(),
-                singleEvents=True,
-                orderBy='startTime'
-            ).execute()
+            # Get current time in user's timezone
+            now = datetime.now(local_tz)
             
-            return events_result.get('items', [])
+            # Map days to weekday numbers (0=Monday, 6=Sunday)
+            day_mapping = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+            target_day = day_mapping[day]
             
-        return []
+            # Calculate days until target day
+            days_ahead = (target_day - now.weekday()) % 7
+            
+            # If it's today and after 6pm, show next week's occurrence instead
+            if days_ahead == 0 and now.hour >= 18:
+                days_ahead = 7
+                
+            start_date = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+        else:
+            # Default to today
+            now = datetime.now(local_tz)
+            start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
         
+        # Ensure datetime is timezone-aware
+        if not hasattr(start_date, 'tzinfo') or start_date.tzinfo is None:
+            start_date = local_tz.localize(start_date)
+            
+        # Set time range to cover the entire day
+        end_date = start_date.replace(hour=23, minute=59, second=59)
+        
+        # Convert to UTC for API call
+        start_datetime_utc = start_date.astimezone(pytz.UTC)
+        end_datetime_utc = end_date.astimezone(pytz.UTC)
+        
+        # Request events from Calendar API
+        events_result = calendar_service.events().list(
+            calendarId='primary',
+            timeMin=start_datetime_utc.isoformat(),
+            timeMax=end_datetime_utc.isoformat(),
+            singleEvents=True,
+            orderBy='startTime',
+            maxResults=50  # Increased to ensure we get all day's events
+        ).execute()
+        
+        events = events_result.get('items', [])
+        
+        formatted_events = []
+        for event in events:
+            # Parse event times
+            event_start = parse_datetime_from_api(
+                event['start'].get('dateTime', event['start'].get('date')), 
+                event['start'].get('timeZone', user_timezone)
+            )
+            
+            event_end = parse_datetime_from_api(
+                event['end'].get('dateTime', event['end'].get('date')),
+                event['end'].get('timeZone', user_timezone)
+            )
+            
+            # Calculate duration in minutes
+            duration = int((event_end - event_start).total_seconds() / 60)
+            
+            # Determine if it's an all-day event
+            all_day = 'date' in event['start'] and 'date' in event['end']
+            
+            formatted_events.append({
+                'id': event['id'],
+                'title': event['summary'],
+                'start': event_start,
+                'end': event_end,
+                'duration': duration,
+                'all_day': all_day,
+                'location': event.get('location', ''),
+                'description': event.get('description', '')
+            })
+        
+        # Sort events by start time
+        formatted_events.sort(key=lambda x: x['start'])
+        
+        return formatted_events
+        
+    except InvalidInputError as e:
+        raise
     except Exception as e:
-        raise CalendarError(f"Error getting events: {str(e)}")
+        error_message = str(e).lower()
+        if "invalid_grant" in error_message:
+            raise AuthenticationError("Your Google Calendar access has expired")
+        elif "quota" in error_message:
+            raise APILimitError("Calendar API limit reached")
+        else:
+            raise Exception(f"Error getting events: {str(e)}")
 
 def format_event_details(events):
-    """Format event details for display with proper timezone handling."""
+    """Format event details for display with improved formatting."""
     if not events:
         return "No events found for this period."
     
-    # Get user's timezone (America/New_York)
-    user_timezone = pytz.timezone('America/New_York')
+    # Get user's timezone for consistent display
+    user_timezone = get_user_timezone()
     
     # Group events by date
     events_by_date = {}
     for event in events:
-        try:
-            # Parse the event times
-            if 'dateTime' in event['start']:
-                # Parse the UTC time
-                start_time = datetime.fromisoformat(event['start']['dateTime'].replace('Z', '+00:00'))
-                end_time = datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00'))
-                
-                # Convert to user's timezone
-                start_time = start_time.astimezone(user_timezone)
-                end_time = end_time.astimezone(user_timezone)
-            else:
-                # Handle all-day events
-                start_time = datetime.fromisoformat(event['start']['date']).replace(tzinfo=user_timezone)
-                end_time = datetime.fromisoformat(event['end']['date']).replace(tzinfo=user_timezone)
-            
-            # Use the converted time for grouping
-            event_date = start_time.date()
-            if event_date not in events_by_date:
-                events_by_date[event_date] = []
-            events_by_date[event_date].append({
-                **event,
-                'start_time': start_time,
-                'end_time': end_time
-            })
-        except Exception as e:
-            print(f"Error processing event time: {str(e)}")
-            continue
+        event_date = event['start'].astimezone(pytz.timezone(user_timezone)).date()
+        if event_date not in events_by_date:
+            events_by_date[event_date] = []
+        events_by_date[event_date].append(event)
     
     # Format output
     details = ""
@@ -608,110 +651,111 @@ def format_event_details(events):
         
         # Add events for this day
         for i, event in enumerate(day_events, 1):
-            # Format the time display using the converted times
-            if 'date' in event['start']:
+            # Format the time display
+            if event.get('all_day', False):
                 time_display = "All day"
             else:
-                time_display = f"{event['start_time'].strftime('%I:%M %p')} - {event['end_time'].strftime('%I:%M %p')}"
+                start_time = event['start'].astimezone(pytz.timezone(user_timezone))
+                end_time = event['end'].astimezone(pytz.timezone(user_timezone))
+                time_display = f"{start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}"
             
             # Format duration display
-            if 'date' in event['start']:
+            hours = event['duration'] // 60
+            minutes = event['duration'] % 60
+            
+            if event.get('all_day', False):
                 duration_str = "All day"
+            elif hours > 0 and minutes > 0:
+                duration_str = f"{hours} hr{'s' if hours != 1 else ''}, {minutes} min"
+            elif hours > 0:
+                duration_str = f"{hours} hr{'s' if hours != 1 else ''}"
             else:
-                duration_minutes = int((event['end_time'] - event['start_time']).total_seconds() / 60)
-                hours = duration_minutes // 60
-                minutes = duration_minutes % 60
-                
-                if hours > 0 and minutes > 0:
-                    duration_str = f"{hours} hr{'s' if hours != 1 else ''}, {minutes} min"
-                elif hours > 0:
-                    duration_str = f"{hours} hr{'s' if hours != 1 else ''}"
-                else:
-                    duration_str = f"{minutes} min"
+                duration_str = f"{minutes} min"
             
             # Build event display
-            details += f"{i}. {event['summary']}\n"
+            details += f"{i}. {event['title']}\n"
             details += f"   ⏰ {time_display}\n"
             details += f"   ⌛ {duration_str}\n"
             
             if event.get('location'):
                 details += f"   📍 {event['location']}\n"
                 
-            if event.get('description'):
-                details += f"   📝 {event['description']}\n"
-                
             details += "\n"
     
     return details
 
-# Add day mapping for get_events_for_day function
-day_map = {
-    'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6
-}
-
 def parse_natural_language(prompt, model):
     """
-    Parse natural language input to extract calendar actions.
+    Parse natural language input to extract multiple calendar events.
     Returns a list of event details dictionaries.
     """
-    system_prompt = """You are an expert calendar assistant helping with calendar operations.
+    system_prompt = """You are an expert calendar assistant helping schedule multiple events.
 Your task is to:
-1. Identify the type of action requested (CREATE, EDIT, DELETE, VIEW)
-2. Extract relevant details for the action
+1. Identify all events mentioned in the prompt
+2. Extract details for each event including:
+   - Title/description
+   - Date/time (or recurring pattern)
+   - Duration
+   - Travel time (if mentioned)
+   - Any dependencies or constraints
+   - Time constraints (e.g., "between 8 AM and 8:30 AM")
+3. Format each event as a separate JSON object
+4. Ensure no time conflicts between events
 
-For CREATE actions, extract:
+For each event, extract:
 - action: "CREATE"
 - title: event name/description
 - date: specific date (YYYY-MM-DD) if mentioned
 - day: day of week if mentioned
-- time: start time
+- time: start time in 12-hour format with AM/PM (e.g., "12:00 PM")
 - duration: duration in minutes
 - travel_time: travel duration in minutes if mentioned
 - recurring: true/false if it's a daily/weekly event
 - constraints: any specific constraints mentioned
+- time_constraints: min/max time if specified (e.g., "between 8 AM and 8:30 AM")
 
-For DELETE actions, extract:
-- action: "DELETE"
-- original_title: event title to delete
-- date: specific date (YYYY-MM-DD) if mentioned
-- day: day of week if mentioned
-- time: specific time if mentioned
+IMPORTANT: Your response must be a valid JSON array of events. Do not include any explanatory text.
+Each event must have at least title, time, and duration.
 
-For EDIT actions, extract:
-- action: "EDIT"
-- original_title: current event title
-- new_title: new title if mentioned
-- date: specific date (YYYY-MM-DD) if mentioned
-- day: day of week if mentioned
-- time: new time if mentioned
-- duration: new duration if mentioned
+For relative time references:
+- Ignore "today" and just use the specified time
+- "tomorrow" should be converted to tomorrow's date
+- "next week" should be converted to a date 7 days from now
+- "this week" should be converted to a date within the next 7 days
+- "next month" should be converted to a date in the next month
 
-For DELETE actions, extract:
-- action: "DELETE"
-- original_title: event title to delete
-- date: specific date (YYYY-MM-DD) if mentioned
-- day: day of week if mentioned
-- time: specific time if mentioned
-
-IMPORTANT: Your response must be a valid JSON array of actions. Do not include any explanatory text.
-Each action must have at least the action type and necessary identifiers.
+For time specifications:
+- Always use 12-hour format with AM/PM
+- Convert "noon" or "12 noon" to "12:00 PM"
+- Convert "midnight" or "12 midnight" to "12:00 AM"
+- Convert "12 pm" to "12:00 PM"
+- Convert "12 am" to "12:00 AM"
+- Always include minutes (e.g., "2:00 PM" not just "2 PM")
 
 Example output format:
 [
-    {
-        "action": "VIEW",
-        "day": "MON"
-    },
     {
         "action": "CREATE",
         "title": "Math Class",
         "day": "THU",
         "time": "06:00 PM",
-        "duration": 180
+        "duration": 180,
+        "travel_time": 30
+    },
+    {
+        "action": "CREATE",
+        "title": "Workout",
+        "recurring": true,
+        "time": "06:00 AM",
+        "duration": 60,
+        "time_constraints": {
+            "min": {"hour": 6, "minute": 0},
+            "max": {"hour": 6, "minute": 0}
+        }
     }
 ]
 
-Now, analyze this prompt and extract all actions. Return ONLY the JSON array:"""
+Now, analyze this prompt and extract all events. Return ONLY the JSON array:"""
 
     try:
         response = model.generate_content(system_prompt + "\n\n" + prompt)
@@ -729,393 +773,424 @@ Now, analyze this prompt and extract all actions. Return ONLY the JSON array:"""
         json_str = response_text[start_idx:end_idx]
         
         # Parse the JSON
-        actions = json.loads(json_str)
+        events = json.loads(json_str)
         
-        # Validate each action
-        validated_actions = []
-        for action in actions:
+        # Process relative time references
+        from datetime import datetime, timedelta
+        today = datetime.now()
+        
+        for event in events:
+            # Handle relative time references in date field
+            if 'date' in event:
+                if event['date'].lower() == 'tomorrow':
+                    event['date'] = (today + timedelta(days=1)).strftime('%Y-%m-%d')
+                elif event['date'].lower() == 'next week':
+                    event['date'] = (today + timedelta(days=7)).strftime('%Y-%m-%d')
+                elif event['date'].lower() == 'this week':
+                    # Default to 3 days from now if "this week" is specified
+                    event['date'] = (today + timedelta(days=3)).strftime('%Y-%m-%d')
+                elif event['date'].lower() == 'next month':
+                    # Add one month to current date
+                    next_month = today.replace(day=1) + timedelta(days=32)
+                    event['date'] = next_month.replace(day=1).strftime('%Y-%m-%d')
+            
+            # Handle relative time references in day field
+            if 'day' in event:
+                if event['day'].lower() == 'tomorrow':
+                    event['date'] = (today + timedelta(days=1)).strftime('%Y-%m-%d')
+                    del event['day']
+            
+            # Standardize time format
+            if 'time' in event:
+                time_str = event['time'].upper()
+                # Handle special cases
+                if time_str in ['NOON', '12 NOON']:
+                    event['time'] = '12:00 PM'
+                elif time_str in ['MIDNIGHT', '12 MIDNIGHT']:
+                    event['time'] = '12:00 AM'
+                elif time_str == '12 PM':
+                    event['time'] = '12:00 PM'
+                elif time_str == '12 AM':
+                    event['time'] = '12:00 AM'
+                else:
+                    # Ensure time is in correct format (HH:MM AM/PM)
+                    try:
+                        # Try to parse the time
+                        time_obj = datetime.strptime(time_str, '%I:%M %p')
+                        event['time'] = time_obj.strftime('%I:%M %p')
+                    except ValueError:
+                        try:
+                            # Try without minutes
+                            time_obj = datetime.strptime(time_str, '%I %p')
+                            event['time'] = time_obj.strftime('%I:00 %p')
+                        except ValueError:
+                            # If parsing fails, keep the original time
+                            pass
+        
+        # Validate each event
+        validated_events = []
+        for event in events:
             try:
-                # Ensure required fields are present based on action type
-                if action['action'] == 'VIEW':
-                    if not any(key in action for key in ['date', 'day']):
-                        print(f"Warning: Skipping VIEW action missing date or day: {action}")
-                        continue
-                elif action['action'] == 'CREATE':
-                    if not all(key in action for key in ['title', 'time']):
-                        print(f"Warning: Skipping CREATE action missing required fields: {action}")
-                        continue
-                elif action['action'] == 'EDIT':
-                    if 'original_title' not in action:
-                        print(f"Warning: Skipping EDIT action missing original title: {action}")
-                        continue
-                elif action['action'] == 'DELETE':
-                    if 'original_title' not in action:
-                        print(f"Warning: Skipping DELETE action missing title: {action}")
-                        continue
-                
-                # Validate the action
-                validated_action = validate_event_details(action)
-                validated_actions.append(validated_action)
+                # Ensure required fields are present
+                if 'title' not in event or 'time' not in event or 'duration' not in event:
+                    print(f"Warning: Skipping event missing required fields: {event}")
+                    continue
+                    
+                # Set default action if not specified
+                if 'action' not in event:
+                    event['action'] = 'CREATE'
+                    
+                # Validate the event
+                validated_event = validate_event_details(event)
+                validated_events.append(validated_event)
             except InvalidInputError as e:
-                print(f"Warning: Skipping invalid action: {str(e)}")
+                print(f"Warning: Skipping invalid event: {str(e)}")
                 continue
                 
-        return validated_actions
+        return validated_events
         
     except Exception as e:
         print(f"Error parsing natural language: {str(e)}")
         return [{
             'action': 'UNKNOWN',
-            'clarification': "I'm having trouble understanding your request. Could you be more specific?"
+            'clarification': "I'm having trouble understanding your schedule. Could you break it down into simpler, separate events?"
         }]
 
-def standardize_time_for_comparison(time_str):
+def detect_message_type(user_text, gemini_model):
     """
-    Convert various time formats to a standard format for comparison.
-    Returns a tuple of (hour, minute) in 24-hour format.
+    Determine if the message is a calendar action, calendar intent, or general conversation.
+    Returns: 'calendar_action', 'calendar_intent', or 'general_conversation'
     """
-    time_str = time_str.strip().upper()
+    system_prompt = """You are an expert at determining the type of message.
+    Return ONLY one of these three words:
     
-    # Handle "HH:MM AM/PM" format
-    time_match = re.match(r'(\d{1,2}):?(\d{2})?\s*(AM|PM)', time_str)
-    if time_match:
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2)) if time_match.group(2) else 0
-        period = time_match.group(3)
-        
-        # Convert to 24-hour format
-        if period == 'PM' and hour != 12:
-            hour += 12
-        elif period == 'AM' and hour == 12:
-            hour = 0
-            
-        return hour, minute
+    'calendar_action' if the message contains specific calendar details like:
+    - Specific time (e.g., "at 2pm", "tomorrow at 3")
+    - Specific date (e.g., "on Monday", "next week")
+    - Specific duration (e.g., "for 1 hour", "30 minutes")
+    - Complete event details
     
-    # Handle "HH AM/PM" format
-    time_match = re.match(r'(\d{1,2})\s*(AM|PM)', time_str)
-    if time_match:
-        hour = int(time_match.group(1))
-        period = time_match.group(2)
-        
-        # Convert to 24-hour format
-        if period == 'PM' and hour != 12:
-            hour += 12
-        elif period == 'AM' and hour == 12:
-            hour = 0
-            
-        return hour, 0
+    'calendar_intent' if the message expresses intent to do calendar actions but lacks specific details:
+    - "I want to schedule some meetings"
+    - "Can you help me set up appointments?"
+    - "I need to plan my week"
+    - Any general calendar-related request without specific details
     
-    # Handle 24-hour format "HH:MM"
-    time_match = re.match(r'(\d{1,2}):?(\d{2})', time_str)
-    if time_match:
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2))
-        return hour, minute
+    'general_conversation' if the message is:
+    - Greetings (hi, hello, etc.)
+    - General questions
+    - Small talk
+    - Non-calendar related topics
     
-    raise ValueError(f"Could not parse time: {time_str}")
+    Your response should be exactly one of these three words."""
 
-def compare_times(time1, time2, tolerance_minutes=5):
-    """
-    Compare two times with a tolerance.
-    time1 and time2 should be tuples of (hour, minute).
-    """
-    hour1, minute1 = time1
-    hour2, minute2 = time2
-    
-    # Convert to minutes since midnight
-    total_minutes1 = hour1 * 60 + minute1
-    total_minutes2 = hour2 * 60 + minute2
-    
-    # Calculate difference
-    diff_minutes = abs(total_minutes1 - total_minutes2)
-    
-    return diff_minutes <= tolerance_minutes
+    try:
+        response = gemini_model.generate_content(system_prompt + "\n\n" + user_text)
+        message_type = response.text.strip().lower()
+        
+        if message_type not in ['calendar_action', 'calendar_intent', 'general_conversation']:
+            # Default to general conversation if unsure
+            return 'general_conversation'
+            
+        return message_type
+    except Exception as e:
+        # Default to general conversation if there's an error
+        return 'general_conversation'
 
-def process_calendar_request(user_text, gemini_model, calendar_service, context=None):
+def handle_calendar_intent(user_text, gemini_model):
     """
-    Process a user's calendar request with conversational flow and context awareness.
+    Handle messages that express intent to do calendar actions but need more details.
+    """
+    system_prompt = """You are Donna, a friendly, empathetic, and motivational calendar assistant.
+    The user has expressed interest in calendar actions but hasn't provided specific details.
+    
+    Your personality traits:
+    1. Always be encouraging and motivational
+    2. Show empathy and understanding
+    3. Be supportive and positive
+    4. Use uplifting language
+    
+    Your task is to:
+    1. Acknowledge their intent with enthusiasm
+    2. Ask for the specific details needed
+    3. Provide examples of what details would be helpful
+    4. End with an encouraging phrase
+    
+    Keep your response friendly and concise. Focus on getting the necessary information to help them.
+    Always end your messages with an encouraging phrase like "You're doing great!", "Keep going!", or "Have a beautiful day!" """
+
+    try:
+        response = gemini_model.generate_content(system_prompt + "\n\n" + user_text)
+        return True, response.text.strip()
+    except Exception as e:
+        return False, "I'd be happy to help you with your calendar! Could you please provide more details about what you'd like to schedule? You're doing great!"
+
+def handle_general_conversation(user_text, gemini_model):
+    """
+    Handle general conversation messages with a friendly, helpful tone.
+    """
+    system_prompt = """You are Donna, a friendly and empathetic calendar assistant. 
+    You can help with calendar management but also engage in general conversation.
+    
+    Your personality traits:
+    1. Be empathetic and understanding
+    2. Show emotional intelligence
+    3. Be supportive when needed
+    4. Keep responses natural and conversational
+    
+    When responding:
+    - If the user seems sad or down, offer to schedule a relaxing activity like a walk, bath, or meditation session
+    - If the user is happy, celebrate with them
+    - If the user is stressed, offer to schedule some relaxation time
+    - Only use encouraging phrases when the user shares feelings or after scheduling events
+    
+    Keep your responses concise, friendly, and helpful.
+    If the user asks about calendar features, briefly explain what you can do.
+    If it's just small talk, be engaging but brief."""
+
+    try:
+        # First check if the user seems to be expressing emotions
+        emotion_prompt = """Analyze if the user is expressing any emotions (sadness, stress, happiness, etc.).
+        Return ONLY one word: 'sad', 'stressed', 'happy', or 'neutral'."""
+        
+        emotion_response = gemini_model.generate_content(emotion_prompt + "\n\n" + user_text)
+        emotion = emotion_response.text.strip().lower()
+        
+        if emotion in ['sad', 'stressed']:
+            # Suggest scheduling a relaxing activity
+            relaxing_activities = [
+                {"title": "Relaxing Walk", "duration": 30, "description": "A peaceful walk to clear your mind"},
+                {"title": "Meditation Session", "duration": 20, "description": "Time to center yourself and find peace"},
+                {"title": "Relaxing Bath", "duration": 45, "description": "A soothing bath to help you unwind"},
+                {"title": "Mindful Break", "duration": 15, "description": "A short break to practice mindfulness"}
+            ]
+            
+            import random
+            activity = random.choice(relaxing_activities)
+            
+            # Create an event for the relaxing activity
+            event_details = {
+                "action": "CREATE",
+                "title": activity["title"],
+                "duration": activity["duration"],
+                "description": activity["description"],
+                "time": "06:00 PM"  # Default to evening
+            }
+            
+            try:
+                start_time, end_time, event_link, _ = handle_calendar_action(event_details, calendar_service)
+                response = f"I understand you're feeling {emotion}. I've scheduled a {activity['title'].lower()} for you at {start_time.strftime('%I:%M %p')}. This should help you feel better. You're doing great!"
+                if event_link:
+                    response += f"\nView event: {event_link}"
+                return True, response
+            except Exception as e:
+                return True, f"I understand you're feeling {emotion}. Would you like me to schedule a relaxing activity for you? I can help you set up a walk, meditation session, or other calming activities."
+        
+        # For other cases, use the general conversation prompt
+        response = gemini_model.generate_content(system_prompt + "\n\n" + user_text)
+        return True, response.text.strip()
+    except Exception as e:
+        return False, "I'm having trouble processing your message. Could you please try again?"
+
+def process_calendar_request(user_text, gemini_model, calendar_service):
+    """
+    Process a user's message, handling calendar actions, intents, and general conversation.
     Returns a tuple of (success, response_message).
     """
     try:
-        # Use context for better understanding if available
-        if context:
-            # Extract relevant information from context
-            conversation_history = "\n".join([f"{msg['role']}: {msg['parts']}" for msg in context])
+        # First determine the message type
+        message_type = detect_message_type(user_text, gemini_model)
+        
+        if message_type == 'general_conversation':
+            return handle_general_conversation(user_text, gemini_model)
             
-            # Add context to the prompt for better understanding
-            enhanced_prompt = f"Previous conversation:\n{conversation_history}\n\nCurrent request: {user_text}"
-        else:
-            enhanced_prompt = user_text
+        if message_type == 'calendar_intent':
+            return handle_calendar_intent(user_text, gemini_model)
         
-        # First, determine if we need more information
-        system_prompt = """You are Donna, a friendly and helpful calendar assistant.
-        Your task is to:
-        1. Determine if you have enough information to execute a calendar action
-        2. If not, ask for the missing information
-        3. If yes, execute the appropriate action
+        # If it's a calendar action, proceed with existing logic
+        events = parse_natural_language(user_text, gemini_model)
         
-        For calendar actions, you need:
+        # If we couldn't parse any events, treat it as a calendar intent
+        if not events or (len(events) == 1 and events[0]['action'] == 'UNKNOWN'):
+            return handle_calendar_intent(user_text, gemini_model)
         
-        For CREATE:
-        - Action type: "CREATE"
-        - Title: meeting/event name
-        - Date/time: when the event will occur
-        - Duration: how long it will last
+        # Process each event
+        responses = []
+        events_scheduled = False
         
-        For DELETE:
-        - Action type: "DELETE"
-        - Original title: the exact title of the event to delete
-        - Date/time: when the event is scheduled (to identify the correct instance)
-        - IMPORTANT: For DELETE, you MUST have both the exact title and time to proceed
-        
-        For EDIT:
-        - Action type: "EDIT"
-        - Original title: current event title
-        - New details: what needs to be changed
-        
-        For VIEW:
-        - Action type: "VIEW"
-        - Day: day of the week (e.g., "THU" for Thursday)
-        - OR Date: specific date (e.g., "2024-04-27")
-        - IMPORTANT: For VIEW, you only need either day OR date, not both
-        
-        When you have enough information, format the event_details like this:
-        
-        For CREATE:
-        {
-            "action": "CREATE",
-            "title": "Meeting Title",
-            "day": "THU",  // 3-letter day code
-            "time": "03:00 PM",  // 12-hour format with AM/PM
-            "duration": 60  // in minutes
-        }
-        
-        For DELETE:
-        {
-            "action": "DELETE",
-            "original_title": "Meeting Title",
-            "day": "THU",  // 3-letter day code
-            "time": "03:00 PM"  // 12-hour format with AM/PM
-        }
-        
-        For EDIT:
-        {
-            "action": "EDIT",
-            "original_title": "Current Title",
-            "new_title": "New Title",  // if changing title
-            "day": "THU",  // if changing day
-            "time": "03:00 PM",  // if changing time
-            "duration": 60  // if changing duration
-        }
-        
-        For VIEW:
-        {
-            "action": "VIEW",
-            "day": "THU"  // 3-letter day code
-            // OR
-            "date": "2024-04-27"  // specific date
-        }
-        
-        Return your response in this format:
-        {
-            "needs_more_info": true/false,
-            "missing_info": ["field1", "field2"],
-            "action": "CREATE/DELETE/EDIT/VIEW/UNKNOWN",
-            "event_details": {...},
-            "response": "Your response to the user"
-        }
-        
-        If the user hasn't provided enough information, set needs_more_info to true and ask for the missing information.
-        If they have provided enough information, set needs_more_info to false and include the complete event details.
-        """
-        
-        # Get structured response from Gemini
-        response = gemini_model.generate_content(system_prompt + "\n\n" + enhanced_prompt)
-        
-        try:
-            # Clean the response text to ensure it's valid JSON
-            response_text = response.text.strip()
-            
-            # Find the JSON object in the response
-            start_idx = response_text.find('{')
-            end_idx = response_text.rfind('}') + 1
-            
-            if start_idx == -1 or end_idx == 0:
-                raise ValueError("No valid JSON object found in response")
-                
-            json_str = response_text[start_idx:end_idx]
-            
-            # Parse the response
-            response_data = json.loads(json_str)
-            
-            if response_data.get("needs_more_info", False):
-                # Return the response asking for more information
-                return True, response_data["response"]
-            
-            # If we have enough information, process the action
-            if response_data.get("action") in ["CREATE", "DELETE", "EDIT", "VIEW"]:
-                # Ensure event_details has the required fields
-                event_details = response_data.get("event_details", {})
-                if not event_details:
-                    return True, "I'm having trouble understanding the event details. Could you please provide them again?"
-                
-                # Ensure action is included in event_details
-                event_details["action"] = response_data["action"]
-                
-                # Special handling for VIEW operations
-                if event_details["action"] == "VIEW":
-                    # Get events for the specified day/date
-                    events = get_events_for_day(
-                        calendar_service,
-                        event_details.get("day"),
-                        event_details.get("date")
-                    )
-                    
-                    if not events:
-                        # Format the day/date for the response
-                        if event_details.get("day"):
-                            day_str = event_details["day"]
-                        else:
-                            try:
-                                date_obj = datetime.strptime(event_details["date"], "%Y-%m-%d")
-                                day_str = date_obj.strftime("%A")
-                            except ValueError:
-                                day_str = event_details["date"]
-                        
-                        return True, f"You have no events scheduled for {day_str}."
-                    
-                    # Format the events for display
-                    formatted_events = format_event_details(events)
-                    return True, formatted_events
-                
-                # Special handling for DELETE operations
-                if event_details["action"] == "DELETE":
-                    # Validate required fields
-                    if "original_title" not in event_details:
-                        return True, "I need to know which event you want to delete. Could you please specify the event title?"
-                    
-                    # Check if we have time information
-                    if "time" not in event_details:
-                        # Find all events with this title on the specified day
-                        search_details = {
-                            "action": "VIEW",
-                            "day": event_details.get("day"),
-                            "date": event_details.get("date")
-                        }
-                        
-                        # Get events for the day
-                        events = get_events_for_day(calendar_service, search_details.get("day"), search_details.get("date"))
-                        
-                        # Filter events by title
-                        matching_events = [
-                            event for event in events 
-                            if event["summary"].lower() == event_details["original_title"].lower()
-                        ]
-                        
-                        if not matching_events:
-                            return True, f"I couldn't find any events with the title '{event_details['original_title']}' on {event_details.get('day', 'the specified day')}."
-                        
-                        # Format the events for display
-                        event_list = "\n".join([
-                            f"{i+1}. {event['summary']} at {event['start'].get('dateTime', 'all day')}"
-                            for i, event in enumerate(matching_events)
-                        ])
-                        
-                        return True, f"I found these events with the title '{event_details['original_title']}':\n{event_list}\n\nWhich one would you like to delete? Please specify the time."
-                    
-                    # If we have time, verify the exact event exists
-                    search_details = {
-                        "action": "VIEW",
-                        "day": event_details.get("day"),
-                        "date": event_details.get("date")
-                    }
-                    
-                    events = get_events_for_day(calendar_service, search_details.get("day"), search_details.get("date"))
-                    
-                    # Find exact match
-                    exact_match = None
-                    try:
-                        # Convert user's time to standard format
-                        user_time = standardize_time_for_comparison(event_details["time"])
-                        
-                        for event in events:
-                            if event["summary"].lower() == event_details["original_title"].lower():
-                                if "dateTime" in event["start"]:
-                                    # Parse the event time
-                                    event_time_str = event["start"]["dateTime"].split("T")[1]
-                                    event_hour = int(event_time_str[:2])
-                                    event_minute = int(event_time_str[3:5])
-                                    
-                                    # Compare times with tolerance
-                                    if compare_times(user_time, (event_hour, event_minute)):
-                                        exact_match = event
-                                        break
-                    except ValueError as e:
-                        return True, f"I'm having trouble understanding the time format. Could you please specify the time in a format like '11:00 AM' or '3:00 PM'?"
-                    
-                    if not exact_match:
-                        # Show all events with this title to help the user
-                        matching_events = [
-                            event for event in events 
-                            if event["summary"].lower() == event_details["original_title"].lower()
-                        ]
-                        
-                        if matching_events:
-                            event_list = "\n".join([
-                                f"{i+1}. {event['summary']} at {event['start'].get('dateTime', 'all day')}"
-                                for i, event in enumerate(matching_events)
-                            ])
-                            return True, f"I couldn't find an event with the title '{event_details['original_title']}' at {event_details['time']} on {event_details.get('day', 'the specified day')}. Here are all the events with this title:\n{event_list}\n\nCould you please verify the time?"
-                        else:
-                            return True, f"I couldn't find any events with the title '{event_details['original_title']}' on {event_details.get('day', 'the specified day')}. Could you please verify the title and time?"
-                
-                # Process the calendar action
-                success, response_message = handle_calendar_action(
-                    event_details,
+        for event in events:
+            try:
+                # Handle the calendar action
+                start_time, end_time, event_link, response_message = handle_calendar_action(
+                    event, 
                     calendar_service
                 )
                 
-                if success:
-                    return True, response_message
-                else:
-                    return False, f"Failed to process action: {response_message}"
-            
-            # If action is UNKNOWN, return the clarification
-            return True, response_data.get("response", "I'm not sure what you'd like to do. Could you be more specific?")
-            
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"Error parsing response: {str(e)}")
-            # If we can't parse the response, fall back to basic processing
-            actions = parse_natural_language(enhanced_prompt, gemini_model)
-            
-            if not actions or (len(actions) == 1 and actions[0]['action'] == 'UNKNOWN'):
-                return True, actions[0].get('clarification', 
-                    "I'm not sure what you'd like to do. Could you rephrase that?")
-            
-            # Process each action
-            responses = []
-            for action in actions:
-                try:
-                    success, response_message = handle_calendar_action(
-                        action, 
-                        calendar_service
-                    )
+                # Build response for this event
+                if event['action'] == 'CREATE':
+                    events_scheduled = True
+                    formatted_start = start_time.strftime('%A, %B %d at %I:%M %p')
+                    hours = event['duration'] // 60
+                    minutes = event['duration'] % 60
                     
-                    if success:
-                        responses.append(response_message)
+                    if hours > 0 and minutes > 0:
+                        duration_str = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
+                    elif hours > 0:
+                        duration_str = f"{hours} hour{'s' if hours != 1 else ''}"
                     else:
-                        responses.append(f"❌ Failed to process action: {response_message}")
+                        duration_str = f"{minutes} minute{'s' if minutes != 1 else ''}"
+                    
+                    event_response = f"✅ Scheduled '{event['title']}' for {formatted_start} ({duration_str})"
+                    
+                    if event.get('travel_time'):
+                        event_response += f" (including {event['travel_time']} minutes travel time)"
                         
-                except Exception as e:
-                    responses.append(f"❌ Failed to process action: {str(e)}")
+                    if event_link:
+                        event_response += f"\nView event: {event_link}"
+                        
+                    responses.append(event_response)
+                    
+            except Exception as e:
+                responses.append(f"❌ Failed to schedule '{event.get('title', 'event')}': {str(e)}")
+        
+        # Combine all responses
+        final_response = "I've processed your schedule:\n\n" + "\n\n".join(responses)
+        
+        # Only add motivational phrase if events were successfully scheduled
+        if events_scheduled:
+            motivational_phrases = [
+                "You're doing great!",
+                "Keep up the amazing work!",
+                "You're making great progress!",
+                "Have a beautiful day!",
+                "You rock!",
+                "Keep going, you're awesome!"
+            ]
+            import random
+            final_response += f"\n\n{random.choice(motivational_phrases)}"
             
-            # Combine all responses
-            final_response = "I've processed your request:\n\n" + "\n\n".join(responses)
-            return True, final_response
+        return True, final_response
         
     except Exception as e:
-        print(f"Error in process_calendar_request: {str(e)}")
-        return False, f"Something unexpected happened. Please try again with a simpler request. Error details: {str(e)}"
+        # If any error occurs, try to handle it as a calendar intent
+        return handle_calendar_intent(user_text, gemini_model)
+
+class TimeSlot:
+    """Represents a time slot for an event."""
+    def __init__(self, start_time, end_time, event_id=None):
+        self.start_time = start_time
+        self.end_time = end_time
+        self.event_id = event_id
+
+    def overlaps(self, other):
+        """Check if this time slot overlaps with another."""
+        return (self.start_time < other.end_time and 
+                self.end_time > other.start_time)
+
+class TimeSlotManager:
+    """Manages time slots to prevent scheduling conflicts."""
+    def __init__(self):
+        self.time_slots = {}  # {date: [TimeSlot, ...]}
+        self.event_priorities = {
+            'class': 1,  # Highest priority
+            'meeting': 1,
+            'social': 2,
+            'study': 3,
+            'workout': 4,
+            'call': 4,
+            'default': 5  # Lowest priority
+        }
+
+    def get_event_priority(self, event_title):
+        """Determine priority of an event based on its title."""
+        title_lower = event_title.lower()
+        for key, priority in self.event_priorities.items():
+            if key in title_lower:
+                return priority
+        return self.event_priorities['default']
+
+    def add_time_slot(self, date, start_time, end_time, event_id):
+        """Add a time slot if it doesn't conflict with existing slots."""
+        if date not in self.time_slots:
+            self.time_slots[date] = []
+        
+        new_slot = TimeSlot(start_time, end_time, event_id)
+        
+        # Check for conflicts
+        for existing_slot in self.time_slots[date]:
+            if new_slot.overlaps(existing_slot):
+                return False
+        
+        self.time_slots[date].append(new_slot)
+        return True
+
+    def find_available_slot(self, date, duration, preferred_start=None, 
+                          min_time=None, max_time=None):
+        """Find an available time slot that meets the constraints."""
+        if date not in self.time_slots:
+            self.time_slots[date] = []
+        
+        # Get current time in the same timezone
+        from datetime import datetime
+        import pytz
+        current_time = datetime.now(pytz.timezone('America/New_York'))
+        
+        # Sort existing slots by start time
+        existing_slots = sorted(self.time_slots[date], key=lambda x: x.start_time)
+        
+        # If no existing slots, return preferred time if within constraints and not in past
+        if not existing_slots:
+            if preferred_start:
+                if (preferred_start >= current_time and
+                    (not min_time or preferred_start >= min_time) and 
+                    (not max_time or preferred_start + timedelta(minutes=duration) <= max_time)):
+                    return preferred_start
+            # Return min_time if it's in the future, otherwise current time
+            if min_time and min_time >= current_time:
+                return min_time
+            return current_time
+        
+        # First try to use preferred time if it's available and not in past
+        if preferred_start and preferred_start >= current_time:
+            preferred_end = preferred_start + timedelta(minutes=duration)
+            if (not min_time or preferred_start >= min_time) and \
+               (not max_time or preferred_end <= max_time):
+                # Check if preferred time conflicts with existing slots
+                preferred_slot = TimeSlot(preferred_start, preferred_end)
+                has_conflict = False
+                for existing_slot in existing_slots:
+                    if preferred_slot.overlaps(existing_slot):
+                        has_conflict = True
+                        break
+                if not has_conflict:
+                    return preferred_start
+        
+        # Check gaps between existing slots
+        for i in range(len(existing_slots) - 1):
+            gap_start = existing_slots[i].end_time
+            gap_end = existing_slots[i + 1].start_time
+            
+            # Skip if gap is in the past
+            if gap_start < current_time:
+                continue
+                
+            gap_duration = (gap_end - gap_start).total_seconds() / 60
+            
+            if gap_duration >= duration:
+                if (not min_time or gap_start >= min_time) and \
+                   (not max_time or gap_start + timedelta(minutes=duration) <= max_time):
+                    return gap_start
+        
+        # Check after last slot if it's in the future
+        last_slot = existing_slots[-1]
+        if last_slot.end_time >= current_time:
+            if (not max_time or last_slot.end_time + timedelta(minutes=duration) <= max_time):
+                return last_slot.end_time
+        
+        # If no suitable slot found, try to find the earliest possible time in the future
+        if min_time and min_time >= current_time:
+            return min_time
+        return current_time
 
 def schedule_event(event_details, calendar_service):
     """Schedule an event with support for travel time and dependencies."""
@@ -1123,50 +1198,101 @@ def schedule_event(event_details, calendar_service):
         from datetime import datetime, timedelta
         import pytz
         
-        # Get user's timezone
-        user_timezone = get_user_timezone()
-        local_tz = pytz.timezone(user_timezone)
-        current_time = datetime.now(local_tz)
+        # Initialize time slot manager if not already done
+        if not hasattr(schedule_event, 'time_slot_manager'):
+            schedule_event.time_slot_manager = TimeSlotManager()
+        
+        time_slot_manager = schedule_event.time_slot_manager
+        
+        # Get user's timezone (default to America/New_York if not set)
+        user_timezone = pytz.timezone('America/New_York')
+        current_time = datetime.now(user_timezone)
         
         # Get the event's date and time
         if 'date' in event_details:
-            event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
-            event_date = local_tz.localize(event_date)
+            try:
+                event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
+                event_date = user_timezone.localize(event_date)
+            except ValueError:
+                raise InvalidInputError("Invalid date format. Please use YYYY-MM-DD format")
+        elif 'day' in event_details:
+            # Convert day name to day number (0=Monday, 6=Sunday)
+            day_mapping = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+            target_day = day_mapping.get(event_details['day'].upper())
+            if target_day is None:
+                raise InvalidInputError(f"Invalid day: {event_details['day']}")
+            
+            # Calculate days until target day
+            days_ahead = (target_day - current_time.weekday()) % 7
+            if days_ahead == 0 and current_time.hour >= 18:  # If it's the same day and after 6 PM
+                days_ahead = 7  # Schedule for next week
+            
+            event_date = current_time.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
         else:
-            today = datetime.now(local_tz)
-            days_ahead = 0
-            while True:
-                current_date = today + timedelta(days=days_ahead)
-                if current_date.strftime('%a').upper()[:3] == event_details['day']:
-                    event_date = current_date
-                    break
-                days_ahead += 1
+            event_date = current_time
         
         # Parse the time
-        time_str = event_details['time']
-        time_parts = time_str.split()
-        hour_min = time_parts[0].split(':')
-        hour = int(hour_min[0])
-        minute = int(hour_min[1]) if len(hour_min) > 1 else 0
-        period = time_parts[1]
+        try:
+            time_str = event_details['time']
+            time_parts = time_str.split()
+            hour_min = time_parts[0].split(':')
+            hour = int(hour_min[0])
+            minute = int(hour_min[1]) if len(hour_min) > 1 else 0
+            period = time_parts[1].upper()
+            
+            # Convert to 24-hour format
+            if period == 'PM' and hour != 12:
+                hour += 12
+            elif period == 'AM' and hour == 12:
+                hour = 0
+        except (ValueError, IndexError, KeyError):
+            raise InvalidInputError("Invalid time format. Please use format like '06:00 PM'")
         
-        # Convert to 24-hour format
-        if period == 'PM' and hour != 12:
-            hour += 12
-        elif period == 'AM' and hour == 12:
-            hour = 0
+        # Create datetime object for preferred start time in user's timezone
+        preferred_start = event_date.replace(hour=hour, minute=minute)
         
-        # Create datetime object for start time in user's timezone
-        start_time = event_date.replace(hour=hour, minute=minute)
-        
-        # Skip if the event is in the past
-        if start_time < current_time:
-            return False, f"Skipped scheduling '{event_details['title']}' as it's in the past"
+        # Only adjust for past time if the event is for today
+        if event_date.date() == current_time.date() and preferred_start < current_time:
+            if 'day' in event_details:
+                preferred_start += timedelta(days=7)  # Move to next week
+            else:
+                preferred_start += timedelta(days=1)  # Move to next day
         
         # Calculate total duration including travel time
         duration = event_details.get('duration', 30)
         travel_time = event_details.get('travel_time', 0)
         total_duration = duration + travel_time
+        
+        # Set time constraints if specified
+        min_time = None
+        max_time = None
+        if 'time_constraints' in event_details:
+            constraints = event_details['time_constraints']
+            if 'min' in constraints:
+                min_time = event_date.replace(
+                    hour=constraints['min']['hour'],
+                    minute=constraints['min']['minute']
+                )
+                # Ensure min_time is not in the past
+                if min_time < current_time:
+                    min_time = current_time
+            if 'max' in constraints:
+                max_time = event_date.replace(
+                    hour=constraints['max']['hour'],
+                    minute=constraints['max']['minute']
+                )
+        
+        # Find available time slot
+        start_time = time_slot_manager.find_available_slot(
+            event_date.date(), 
+            total_duration,
+            preferred_start,
+            min_time,
+            max_time
+        )
+        
+        if not start_time:
+            raise Exception("No available time slot found that meets the constraints")
         
         # Adjust for travel time
         if travel_time:
@@ -1185,11 +1311,11 @@ def schedule_event(event_details, calendar_service):
             'summary': event_details['title'],
             'start': {
                 'dateTime': start_time_utc.isoformat(),
-                'timeZone': user_timezone,
+                'timeZone': 'UTC',
             },
             'end': {
                 'dateTime': end_time_utc.isoformat(),
-                'timeZone': user_timezone,
+                'timeZone': 'UTC',
             },
             'description': f"Duration: {duration} minutes" + \
                          (f"\nTravel time: {travel_time} minutes" if travel_time else "")
@@ -1201,27 +1327,26 @@ def schedule_event(event_details, calendar_service):
         
         created_event = calendar_service.events().insert(calendarId='primary', body=event).execute()
         
-        # Format the response message
-        formatted_start = start_time.strftime('%A, %B %d at %I:%M %p')
-        hours = duration // 60
-        minutes = duration % 60
+        # Add the time slot to the manager (using local time)
+        time_slot_manager.add_time_slot(
+            event_date.date(),
+            start_time,
+            end_time,
+            created_event['id']
+        )
         
-        if hours > 0 and minutes > 0:
-            duration_str = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
-        elif hours > 0:
-            duration_str = f"{hours} hour{'s' if hours != 1 else ''}"
-        else:
-            duration_str = f"{minutes} minute{'s' if minutes != 1 else ''}"
+        return start_time, end_time, created_event.get('htmlLink'), None
         
-        response_message = f"✅ Scheduled '{event_details['title']}' for {formatted_start} ({duration_str})"
-        
-        if travel_time:
-            response_message += f" (including {travel_time} minutes travel time)"
-            
-        return True, response_message
-        
+    except InvalidInputError as e:
+        raise
     except Exception as e:
-        return False, f"Error scheduling event: {str(e)}"
+        error_message = str(e).lower()
+        if "invalid_grant" in error_message:
+            raise AuthenticationError("Your Google Calendar access has expired")
+        elif "quota" in error_message:
+            raise APILimitError("Calendar API limit reached")
+        else:
+            raise Exception(f"Error scheduling event: {str(e)}")
 
 def edit_event(event_details, calendar_service):
     """Edit an existing event with improved handling."""
@@ -1374,19 +1499,24 @@ def edit_event(event_details, calendar_service):
             raise Exception(f"Error editing event: {str(e)}")
 
 def delete_event(event_details, calendar_service):
-    """Delete an event from Google Calendar."""
+    """Delete an event with improved error handling."""
     try:
-        # Find the event to delete
-        events = get_week_events(calendar_service, datetime.now())
-        event_to_delete = None
+        # Validate the input first
+        event_details = validate_event_details(event_details)
         
-        for event in events:
-            if event['summary'].lower() == event_details['original_title'].lower():
-                event_to_delete = event
-                break
+        # Find matching events
+        matching_events = find_matching_events(calendar_service, event_details)
         
-        if not event_to_delete:
-            return False, f"Could not find event with title: {event_details['original_title']}"
+        if not matching_events:
+            raise EventNotFoundError("I couldn't find any events matching your description")
+        
+        if len(matching_events) > 1:
+            # Multiple matches found, provide details for selection
+            return None, None, None, format_event_details(matching_events) + "\nPlease specify which event you want to delete by providing more specific details."
+        
+        # Get the event to delete
+        event_to_delete = matching_events[0]
+        event_title = event_to_delete['title']
         
         # Delete the event
         calendar_service.events().delete(
@@ -1394,10 +1524,20 @@ def delete_event(event_details, calendar_service):
             eventId=event_to_delete['id']
         ).execute()
         
-        return True, f"I've deleted '{event_details['original_title']}' from your calendar."
+        return None, None, None, f"I've deleted '{event_title}' from your calendar."
         
+    except EventNotFoundError as e:
+        raise
+    except InvalidInputError as e:
+        raise
     except Exception as e:
-        return False, f"Error deleting event: {str(e)}"
+        error_message = str(e).lower()
+        if "invalid_grant" in error_message:
+            raise AuthenticationError("Your Google Calendar access has expired")
+        elif "quota" in error_message:
+            raise APILimitError("Calendar API limit reached")
+        else:
+            raise Exception(f"Error deleting event: {str(e)}")
 
 def parse_schedule_prompt(prompt):
 

@@ -36,7 +36,7 @@ with open('style.css') as f:
 # Initialize session state for chat history
 if 'messages' not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hello! I'm Donna, your friendly calendar assistant. How can I help you manage your schedule today?"}
+        {"role": "model", "parts": "Hello! I'm Donna, your friendly calendar assistant. How can I help you manage your schedule today?"}
     ]
 
 
@@ -46,7 +46,7 @@ if 'last_prompt' not in st.session_state:
 
 # Function to add a message to the chat history
 def add_message(role, content):
-    st.session_state.messages.append({"role": role, "content": content})
+    st.session_state.messages.append({"role": role, "parts": content})
 
 
 # Main layout - Two columns
@@ -64,27 +64,27 @@ with col1:
     with chat_container:
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
-                st.write(message["content"])
+                st.write(message["parts"])
     
     # Chat input at the bottom
     if prompt := st.chat_input("What would you like to do with your calendar?"):
         if prompt != st.session_state.last_prompt:
             st.session_state.last_prompt = prompt
-            st.session_state.messages.append({"role": "user", "content": prompt})
+            st.session_state.messages.append({"role": "user", "parts": prompt})
             
             try:
                 # Process the calendar request using the new function
-                success, response = process_calendar_request(prompt, model, st.session_state.calendar_service)
+                success, response = process_calendar_request(prompt, model, st.session_state.calendar_service, context=st.session_state.messages)
                 
                 # Add the response to the chat history
-                st.session_state.messages.append({"role": "assistant", "content": response})
+                st.session_state.messages.append({"role": "model", "parts": response})
                 
                 # Only refresh if the request was successful
                 if success:
                     st.rerun()
             except Exception as e:
                 error_msg = f"I'm having trouble understanding your request. Could you please rephrase it? Error: {str(e)}"
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                st.session_state.messages.append({"role": "model", "parts": error_msg})
                 st.rerun()
 
 
