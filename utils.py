@@ -1300,8 +1300,18 @@ def schedule_event(event_details, calendar_service):
             # Parse the date string to get the date
             event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
             event_date = local_tz.localize(event_date)
+        elif 'day' in event_details:
+            # Find the next occurrence of the specified day
+            today = current_time
+            days_ahead = 0
+            while True:
+                current_date = today + timedelta(days=days_ahead)
+                if current_date.strftime('%a').upper()[:3] == event_details['day']:
+                    event_date = current_date
+                    break
+                days_ahead += 1
         else:
-            # If no date specified, use today
+            # If no date or day specified, use today
             event_date = current_time
         
         # Parse the time
