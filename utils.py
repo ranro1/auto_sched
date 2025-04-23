@@ -757,16 +757,19 @@ def process_calendar_request(user_text, gemini_model, calendar_service):
 def schedule_event(event_details, calendar_service):
     """Schedule an event with support for travel time and dependencies."""
     try:
-        # Calculate start time considering travel time
         from datetime import datetime, timedelta
         import pytz
+        
+        # Get user's timezone
+        user_timezone = get_user_timezone()
+        local_tz = pytz.timezone(user_timezone)
         
         # Get the event's date and time
         if 'date' in event_details:
             event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
+            event_date = local_tz.localize(event_date)
         else:
-            # Find next occurrence of the specified day
-            today = datetime.now()
+            today = datetime.now(local_tz)
             days_ahead = 0
             while True:
                 current_date = today + timedelta(days=days_ahead)
@@ -789,30 +792,39 @@ def schedule_event(event_details, calendar_service):
         elif period == 'AM' and hour == 12:
             hour = 0
         
-        # Create datetime object
+        # Create datetime object for start time in user's timezone
         start_time = event_date.replace(hour=hour, minute=minute)
         
-        # Adjust for travel time if specified
+        # Calculate total duration including travel time
+        duration = event_details.get('duration', 30)
         travel_time = event_details.get('travel_time', 0)
+        total_duration = duration + travel_time
+        
+        # Adjust for travel time
         if travel_time:
             start_time = start_time - timedelta(minutes=travel_time)
         
         # Calculate end time
-        duration = event_details.get('duration', 30)
-        end_time = start_time + timedelta(minutes=duration + travel_time)
+        end_time = start_time + timedelta(minutes=total_duration)
+        
+        # Convert times to UTC for Google Calendar
+        utc = pytz.UTC
+        start_time_utc = start_time.astimezone(utc)
+        end_time_utc = end_time.astimezone(utc)
         
         # Create event in Google Calendar
         event = {
             'summary': event_details['title'],
             'start': {
-                'dateTime': start_time.isoformat(),
-                'timeZone': 'UTC',
+                'dateTime': start_time_utc.isoformat(),
+                'timeZone': user_timezone,
             },
             'end': {
-                'dateTime': end_time.isoformat(),
-                'timeZone': 'UTC',
+                'dateTime': end_time_utc.isoformat(),
+                'timeZone': user_timezone,
             },
-            'description': f"Duration: {duration} minutes" + (f"\nTravel time: {travel_time} minutes" if travel_time else "")
+            'description': f"Duration: {duration} minutes" + \
+                         (f"\nTravel time: {travel_time} minutes" if travel_time else "")
         }
         
         # Add any constraints to the description

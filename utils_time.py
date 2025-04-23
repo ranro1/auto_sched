@@ -261,55 +261,65 @@ class ParsingError(CalendarError):
     pass
 
 def handle_calendar_action(event_details, calendar_service):
-    """Handle different calendar actions with improved error handling"""
+    """Handle calendar actions with support for multiple events and dependencies."""
     try:
         if event_details['action'] == 'CREATE':
+            # For recurring events, create multiple events
+            if event_details.get('recurring'):
+                # Get the next 7 days
+                from datetime import datetime, timedelta
+                today = datetime.now()
+                events = []
+                
+                for i in range(7):
+                    current_date = today + timedelta(days=i)
+                    # Skip if it's a specific day and doesn't match
+                    if 'day' in event_details:
+                        if current_date.strftime('%a').upper()[:3] != event_details['day']:
+                            continue
+                    
+                    # Create event for this day
+                    event_copy = event_details.copy()
+                    event_copy['date'] = current_date.strftime('%Y-%m-%d')
+                    del event_copy['recurring']
+                    if 'day' in event_copy:
+                        del event_copy['day']
+                    
+                    try:
+                        start_time, end_time, event_link, _ = schedule_event(event_copy, calendar_service)
+                        events.append((start_time, end_time, event_link))
+                    except Exception as e:
+                        print(f"Warning: Failed to create recurring event for {current_date}: {str(e)}")
+                        continue
+                
+                if not events:
+                    return None, None, None, "Failed to create any recurring events"
+                
+                # Return the first event's details and a summary message
+                first_event = events[0]
+                summary = f"Created recurring event '{event_details['title']}' for the next 7 days"
+                return first_event[0], first_event[1], first_event[2], summary
+            
+            # For single events
             return schedule_event(event_details, calendar_service)
+            
         elif event_details['action'] == 'EDIT':
             return edit_event(event_details, calendar_service)
+            
         elif event_details['action'] == 'DELETE':
             return delete_event(event_details, calendar_service)
+            
         elif event_details['action'] == 'VIEW':
-            try:
-                events = get_events_for_day(
-                    calendar_service, 
-                    event_details.get('day'), 
-                    event_details.get('date')
-                )
-                if not events:
-                    return None, None, None, "You have no events scheduled for this day."
-                return None, None, None, format_event_details(events)
-            except Exception as e:
-                if "invalid date format" in str(e).lower():
-                    raise InvalidInputError(f"I couldn't understand the date format. Please use YYYY-MM-DD format.")
-                else:
-                    raise
+            events = get_events_for_day(calendar_service, event_details.get('day'), event_details.get('date'))
+            if not events:
+                return None, None, None, "You have no events scheduled for this day."
+            return None, None, None, format_event_details(events)
+            
         elif event_details['action'] == 'UNKNOWN':
             return None, None, None, event_details['clarification']
-        else:
-            raise InvalidInputError(f"Unknown action type: {event_details['action']}")
             
-    except AuthenticationError as e:
-        return None, None, None, f"Authentication error: {str(e)}. Please reconnect your Google Calendar."
-    except EventNotFoundError as e:
-        return None, None, None, f"I couldn't find that event: {str(e)}. Could you provide more details?"
-    except InvalidInputError as e:
-        return None, None, None, f"There was an issue with the information provided: {str(e)}"
-    except APILimitError:
-        return None, None, None, "We've hit Google's API rate limits. Please try again in a few minutes."
-    except ParsingError as e:
-        return None, None, None, f"I'm having trouble understanding your request: {str(e)}"
     except Exception as e:
-        # Generic error handling as a last resort
-        error_message = str(e)
-        if "invalid_grant" in error_message:
-            return None, None, None, "Your Google Calendar connection needs to be refreshed. Please reconnect your account."
-        elif "quota" in error_message.lower():
-            return None, None, None, "Google Calendar API limit reached. Please try again later."
-        else:
-            # Log the full error for debugging (would go to your logging system)
-            print(f"Unexpected error in calendar action: {error_message}")
-            return None, None, None, "I encountered an unexpected problem with your calendar. Please try again or contact support if the issue persists."
+        raise Exception(f"Error handling calendar action: {str(e)}")
 
 def calculate_title_similarity(title1, title2):
     """
@@ -742,295 +752,394 @@ def format_event_details(events):
     return details
 
 def parse_natural_language(prompt, model):
-    """Use Gemini to parse natural language with improved context and fallbacks."""
-    try:
-        system_prompt = """
-        You are a friendly personal assistant helping with calendar management. You have a warm, helpful personality and make scheduling feel effortless. Your task is to understand the user's intent and extract relevant information.
-        
-        You can have natural conversations with the user about anything, not just calendar management. When the user is just chatting or asking general questions, respond in a friendly, conversational way.
-        
-        When the user wants to do something with their calendar, parse it carefully and extract the intent and details.
-        
-        POSSIBLE ACTIONS:
-        1. CREATE: Create a new event
-        2. EDIT: Modify an existing event
-        3. DELETE: Remove an existing event
-        4. VIEW: View events for a specific day/date
-        5. UNKNOWN: Used when the intent is unclear or for general conversation
-        
-        EXTRACTION REQUIREMENTS:
-        - action: One of CREATE, EDIT, DELETE, VIEW, or UNKNOWN
-        - title: The event title/description
-        - day: The day of the week (MON, TUE, WED, THU, FRI, SAT, SUN)
-        - date: The date in format YYYY-MM-DD
-        - time: The time in 12-hour format with AM/PM (e.g., "05:00 PM")
-        - duration: Duration in minutes (default to 30 if not specified)
-        - original_title: For EDIT/DELETE actions, the original event title to identify the event
-        - new_title: For EDIT action, the new title if specified
-        - clarification: For UNKNOWN action, what information is missing or a friendly response for general conversation
-        
-        HANDLING USER EXPRESSIONS:
-        - Interpret time expressions like "tomorrow", "next Monday", "this afternoon", etc.
-        - For times like "afternoon", use: morning = 9am, afternoon = 2pm, evening = 7pm
-        - For "lunch meeting", default to noon (12:00 PM)
-        - For "breakfast meeting", default to 8:00 AM
-        - For "dinner meeting", default to 7:00 PM
-        - If only day of week is specified, find the next occurrence of that day
-        - If someone says "meeting with X", it should be a CREATE action
-        - If someone mentions "cancel" or "delete", it's likely a DELETE action
-        - If someone mentions "change" or "move" or "reschedule", it's likely an EDIT action
-        - If someone says "what's on my calendar", it's a VIEW action
-        - Default duration for meetings is 30 minutes unless specified
-        
-        SPECIAL HANDLING:
-        - When the query is clearly not calendar-related, set action to "UNKNOWN" with a helpful conversational response
-        - For small talk or greetings, respond with an appropriate conversational message
-        - If a description or location is mentioned, include those fields
-        
-        OUTPUT FORMAT:
-        Return a JSON object with the extracted fields. Include only fields that are relevant to the detected action.
-        Do not include explanation text outside the JSON.
-        
-        Example outputs:
-        
-        For calendar actions:
-        {"action": "CREATE", "title": "Team meeting", "day": "TUE", "time": "10:00 AM", "duration": 60}
-        {"action": "EDIT", "original_title": "Doctor appointment", "new_title": "Dentist appointment", "day": "WED", "time": "02:00 PM"}
-        {"action": "DELETE", "original_title": "Gym class", "day": "FRI", "time": "05:00 PM"}
-        {"action": "VIEW", "day": "MON"}
-        
-        For general conversation:
-        {"action": "UNKNOWN", "clarification": "Hi! How can I help you today? I can help you manage your calendar or just chat."}
-        {"action": "UNKNOWN", "clarification": "I'm doing well, thank you for asking! How can I assist you with your schedule today?"}
-        {"action": "UNKNOWN", "clarification": "That's interesting! While I'm here to help with your calendar, I'm happy to chat about other things too."}
-        """
-        
-        # Add examples of real-world inputs for improved comprehension
-        examples = """
-        Examples of user inputs and expected outputs:
-        
-        Input: "Hi, how are you?"
-        Output: {"action": "UNKNOWN", "clarification": "Hello! I'm doing well, thank you for asking. How can I help you today? I can assist with your calendar or just chat."}
-        
-        Input: "What's the weather like?"
-        Output: {"action": "UNKNOWN", "clarification": "I'm here to help with your calendar, but I can't check the weather. Would you like to see your schedule for today?"}
-        
-        Input: "I need to meet John for coffee tomorrow afternoon"
-        Output: {"action": "CREATE", "title": "Coffee with John", "date": "2023-04-23", "time": "02:00 PM", "duration": 30}
-        
-        Input: "Schedule a doctor appointment on Friday at 3pm"
-        Output: {"action": "CREATE", "title": "Doctor appointment", "day": "FRI", "time": "03:00 PM", "duration": 30}
-        
-        Input: "My dentist appointment on Wednesday needs to be moved to Thursday at 2pm"
-        Output: {"action": "EDIT", "original_title": "Dentist appointment", "day": "THU", "time": "02:00 PM"}
-        
-        Input: "Cancel my lunch with Sarah tomorrow"
-        Output: {"action": "DELETE", "original_title": "Lunch with Sarah", "date": "2023-04-23", "time": "12:00 PM"}
-        
-        Input: "What's on my calendar for next Monday?"
-        Output: {"action": "VIEW", "day": "MON"}
-        """
-        
-        # Generate current date information to help with relative date references
-        from datetime import datetime
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        current_day = datetime.now().strftime("%a").upper()[:3]
-        date_context = f"Current date: {current_date}, Current day: {current_day}"
-        
-        # Combine prompts with date context
-        full_prompt = f"{system_prompt}\n\n{examples}\n\n{date_context}\n\nUser text: {prompt}"
-        
-        # Get response from Gemini
-        response = model.generate_content(full_prompt)
-        
-        try:
-            # Extract JSON from response
-            text = response.text.strip()
-            # Find the JSON part in the response (looking for opening/closing braces)
-            json_start = text.find('{')
-            json_end = text.rfind('}') + 1
-            
-            if json_start < 0 or json_end <= 0:
-                raise ValueError("No valid JSON found in response")
-                
-            json_str = text[json_start:json_end]
-            event_details = json.loads(json_str)
-            
-            # Post-process the extracted data
-            
-            # Standardize date format if present
-            if 'date' in event_details:
-                try:
-                    event_details['date'] = standardize_date_format(event_details['date'])
-                except InvalidInputError:
-                    # If standardizing fails, remove the date
-                    del event_details['date']
-            
-            # Standardize time format if present
-            if 'time' in event_details:
-                try:
-                    event_details['time'] = standardize_time_format(event_details['time'])
-                except InvalidInputError:
-                    # Use default times based on context if standardizing fails
-                    if 'lunch' in prompt.lower():
-                        event_details['time'] = '12:00 PM'
-                    elif 'breakfast' in prompt.lower():
-                        event_details['time'] = '08:00 AM'
-                    elif 'dinner' in prompt.lower():
-                        event_details['time'] = '07:00 PM'
-                    elif 'morning' in prompt.lower():
-                        event_details['time'] = '09:00 AM'
-                    elif 'afternoon' in prompt.lower():
-                        event_details['time'] = '02:00 PM'
-                    elif 'evening' in prompt.lower():
-                        event_details['time'] = '07:00 PM'
-                    else:
-                        # If no context clues, remove the time
-                        del event_details['time']
-            
-            # Standardize day format if present
-            if 'day' in event_details:
-                try:
-                    event_details['day'] = standardize_day_format(event_details['day'])
-                except InvalidInputError:
-                    # If standardizing fails, remove the day
-                    del event_details['day']
-            
-            # Make sure required fields are present based on action
-            if event_details['action'] == 'CREATE':
-                if 'title' not in event_details:
-                    event_details['title'] = 'Untitled Event'
-                if 'duration' not in event_details:
-                    event_details['duration'] = 30
-            
-            return event_details
-            
-        except json.JSONDecodeError:
-            # Fallback if JSON parsing fails
-            return {
-                'action': 'UNKNOWN',
-                'clarification': 'I had trouble understanding your request. Could you rephrase it in terms of creating, viewing, editing, or deleting a calendar event?'
-            }
-            
-    except Exception as e:
-        # Final fallback for any other errors
-        return {
-            'action': 'UNKNOWN',
-            'clarification': f'Sorry, I experienced a technical issue. Could you try again with a simpler request?'
+    """
+    Parse natural language input to extract multiple calendar events.
+    Returns a list of event details dictionaries.
+    """
+    system_prompt = """You are an expert calendar assistant helping schedule multiple events.
+Your task is to:
+1. Identify all events mentioned in the prompt
+2. Extract details for each event including:
+   - Title/description
+   - Date/time (or recurring pattern)
+   - Duration
+   - Travel time (if mentioned)
+   - Any dependencies or constraints
+   - Time constraints (e.g., "between 8 AM and 8:30 AM")
+3. Format each event as a separate JSON object
+4. Ensure no time conflicts between events
+
+For each event, extract:
+- action: "CREATE"
+- title: event name/description
+- date: specific date (YYYY-MM-DD) if mentioned
+- day: day of week if mentioned
+- time: start time
+- duration: duration in minutes
+- travel_time: travel duration in minutes if mentioned
+- recurring: true/false if it's a daily/weekly event
+- constraints: any specific constraints mentioned
+- time_constraints: min/max time if specified (e.g., "between 8 AM and 8:30 AM")
+
+IMPORTANT: Your response must be a valid JSON array of events. Do not include any explanatory text.
+Each event must have at least title, time, and duration.
+
+Example output format:
+[
+    {
+        "action": "CREATE",
+        "title": "Math Class",
+        "day": "THU",
+        "time": "06:00 PM",
+        "duration": 180,
+        "travel_time": 30
+    },
+    {
+        "action": "CREATE",
+        "title": "Workout",
+        "recurring": true,
+        "time": "06:00 AM",
+        "duration": 60,
+        "time_constraints": {
+            "min": {"hour": 6, "minute": 0},
+            "max": {"hour": 6, "minute": 0}
         }
-    
-def handle_calendar_action(event_details, calendar_service):
-    """Handle different calendar actions based on the parsed event details."""
+    }
+]
+
+Now, analyze this prompt and extract all events. Return ONLY the JSON array:"""
+
     try:
-        if event_details['action'] == 'CREATE':
-            return schedule_event(event_details, calendar_service)
-        elif event_details['action'] == 'EDIT':
-            return edit_event(event_details, calendar_service)
-        elif event_details['action'] == 'DELETE':
-            return delete_event(event_details, calendar_service)
-        elif event_details['action'] == 'VIEW':
-            events = get_events_for_day(calendar_service, event_details.get('day'), event_details.get('date'))
-            if not events:
-                return None, None, None, "You have no events scheduled for this day."
-            return None, None, None, format_event_details(events)
-        elif event_details['action'] == 'UNKNOWN':
-            return None, None, None, event_details['clarification']
+        response = model.generate_content(system_prompt + "\n\n" + prompt)
+        
+        # Clean the response to ensure it's valid JSON
+        response_text = response.text.strip()
+        
+        # Find the JSON array in the response
+        start_idx = response_text.find('[')
+        end_idx = response_text.rfind(']') + 1
+        
+        if start_idx == -1 or end_idx == 0:
+            raise ValueError("No valid JSON array found in response")
+            
+        json_str = response_text[start_idx:end_idx]
+        
+        # Parse the JSON
+        events = json.loads(json_str)
+        
+        # Validate each event
+        validated_events = []
+        for event in events:
+            try:
+                # Ensure required fields are present
+                if 'title' not in event or 'time' not in event or 'duration' not in event:
+                    print(f"Warning: Skipping event missing required fields: {event}")
+                    continue
+                    
+                # Set default action if not specified
+                if 'action' not in event:
+                    event['action'] = 'CREATE'
+                    
+                # Validate the event
+                validated_event = validate_event_details(event)
+                validated_events.append(validated_event)
+            except InvalidInputError as e:
+                print(f"Warning: Skipping invalid event: {str(e)}")
+                continue
+                
+        return validated_events
+        
     except Exception as e:
-        raise Exception(f"Error handling calendar action: {str(e)}")
+        print(f"Error parsing natural language: {str(e)}")
+        return [{
+            'action': 'UNKNOWN',
+            'clarification': "I'm having trouble understanding your schedule. Could you break it down into simpler, separate events?"
+        }]
+
+def process_calendar_request(user_text, gemini_model, calendar_service):
+    """
+    Process a user's calendar request with support for multiple events.
+    Returns a tuple of (success, response_message).
+    """
+    try:
+        # Parse natural language input to get multiple events
+        events = parse_natural_language(user_text, gemini_model)
+        
+        # If we couldn't parse any events, return the clarification message
+        if not events or (len(events) == 1 and events[0]['action'] == 'UNKNOWN'):
+            return True, events[0].get('clarification', 
+                "I'm not sure what you'd like to schedule. Could you rephrase that?")
+        
+        # Process each event
+        responses = []
+        for event in events:
+            try:
+                # Handle the calendar action
+                start_time, end_time, event_link, response_message = handle_calendar_action(
+                    event, 
+                    calendar_service
+                )
+                
+                # Build response for this event
+                if event['action'] == 'CREATE':
+                    formatted_start = start_time.strftime('%A, %B %d at %I:%M %p')
+                    hours = event['duration'] // 60
+                    minutes = event['duration'] % 60
+                    
+                    if hours > 0 and minutes > 0:
+                        duration_str = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
+                    elif hours > 0:
+                        duration_str = f"{hours} hour{'s' if hours != 1 else ''}"
+                    else:
+                        duration_str = f"{minutes} minute{'s' if minutes != 1 else ''}"
+                    
+                    event_response = f"✅ Scheduled '{event['title']}' for {formatted_start} ({duration_str})"
+                    
+                    if event.get('travel_time'):
+                        event_response += f" (including {event['travel_time']} minutes travel time)"
+                        
+                    if event_link:
+                        event_response += f"\nView event: {event_link}"
+                        
+                    responses.append(event_response)
+                    
+            except Exception as e:
+                responses.append(f"❌ Failed to schedule '{event.get('title', 'event')}': {str(e)}")
+        
+        # Combine all responses
+        final_response = "I've processed your schedule:\n\n" + "\n\n".join(responses)
+        return True, final_response
+        
+    except Exception as e:
+        return False, f"Something unexpected happened. Please try again with a simpler request. Error details: {str(e)}"
+
+class TimeSlot:
+    """Represents a time slot for an event."""
+    def __init__(self, start_time, end_time, event_id=None):
+        self.start_time = start_time
+        self.end_time = end_time
+        self.event_id = event_id
+
+    def overlaps(self, other):
+        """Check if this time slot overlaps with another."""
+        return (self.start_time < other.end_time and 
+                self.end_time > other.start_time)
+
+class TimeSlotManager:
+    """Manages time slots to prevent scheduling conflicts."""
+    def __init__(self):
+        self.time_slots = {}  # {date: [TimeSlot, ...]}
+        self.event_priorities = {
+            'class': 1,  # Highest priority
+            'meeting': 1,
+            'social': 2,
+            'study': 3,
+            'workout': 4,
+            'call': 4,
+            'default': 5  # Lowest priority
+        }
+
+    def get_event_priority(self, event_title):
+        """Determine priority of an event based on its title."""
+        title_lower = event_title.lower()
+        for key, priority in self.event_priorities.items():
+            if key in title_lower:
+                return priority
+        return self.event_priorities['default']
+
+    def add_time_slot(self, date, start_time, end_time, event_id):
+        """Add a time slot if it doesn't conflict with existing slots."""
+        if date not in self.time_slots:
+            self.time_slots[date] = []
+        
+        new_slot = TimeSlot(start_time, end_time, event_id)
+        
+        # Check for conflicts
+        for existing_slot in self.time_slots[date]:
+            if new_slot.overlaps(existing_slot):
+                return False
+        
+        self.time_slots[date].append(new_slot)
+        return True
+
+    def find_available_slot(self, date, duration, preferred_start=None, 
+                          min_time=None, max_time=None):
+        """Find an available time slot that meets the constraints."""
+        if date not in self.time_slots:
+            self.time_slots[date] = []
+        
+        # Sort existing slots by start time
+        existing_slots = sorted(self.time_slots[date], key=lambda x: x.start_time)
+        
+        # If no existing slots, return preferred time if within constraints
+        if not existing_slots:
+            if preferred_start:
+                if (not min_time or preferred_start >= min_time) and \
+                   (not max_time or preferred_start + timedelta(minutes=duration) <= max_time):
+                    return preferred_start
+            return min_time if min_time else datetime.now().replace(hour=0, minute=0)
+        
+        # First try to use preferred time if it's available
+        if preferred_start:
+            preferred_end = preferred_start + timedelta(minutes=duration)
+            if (not min_time or preferred_start >= min_time) and \
+               (not max_time or preferred_end <= max_time):
+                # Check if preferred time conflicts with existing slots
+                preferred_slot = TimeSlot(preferred_start, preferred_end)
+                has_conflict = False
+                for existing_slot in existing_slots:
+                    if preferred_slot.overlaps(existing_slot):
+                        has_conflict = True
+                        break
+                if not has_conflict:
+                    return preferred_start
+        
+        # Check gaps between existing slots
+        for i in range(len(existing_slots) - 1):
+            gap_start = existing_slots[i].end_time
+            gap_end = existing_slots[i + 1].start_time
+            gap_duration = (gap_end - gap_start).total_seconds() / 60
+            
+            if gap_duration >= duration:
+                if (not min_time or gap_start >= min_time) and \
+                   (not max_time or gap_start + timedelta(minutes=duration) <= max_time):
+                    return gap_start
+        
+        # Check after last slot
+        last_slot = existing_slots[-1]
+        if (not max_time or last_slot.end_time + timedelta(minutes=duration) <= max_time):
+            return last_slot.end_time
+        
+        # If no suitable slot found, try to find the earliest possible time
+        if min_time:
+            return min_time
+        return datetime.now().replace(hour=0, minute=0)
 
 def schedule_event(event_details, calendar_service):
-    """Schedule an event in Google Calendar with improved handling."""
+    """Schedule an event with support for travel time and dependencies."""
     try:
-        # Validate the input first
-        event_details = validate_event_details(event_details)
+        from datetime import datetime, timedelta
+        import pytz
         
-        # Get user's timezone
-        user_timezone = get_user_timezone()
+        # Initialize time slot manager if not already done
+        if not hasattr(schedule_event, 'time_slot_manager'):
+            schedule_event.time_slot_manager = TimeSlotManager()
+        
+        time_slot_manager = schedule_event.time_slot_manager
+        
+        # Get user's timezone (default to America/New_York if not set)
+        user_timezone = pytz.timezone('America/New_York')
+        
+        # Get the event's date and time
+        if 'date' in event_details:
+            event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
+            event_date = user_timezone.localize(event_date)
+        else:
+            today = datetime.now(user_timezone)
+            days_ahead = 0
+            while True:
+                current_date = today + timedelta(days=days_ahead)
+                if current_date.strftime('%a').upper()[:3] == event_details['day']:
+                    event_date = current_date
+                    break
+                days_ahead += 1
         
         # Parse the time
-        try:
-            time_obj = datetime.strptime(event_details['time'], '%I:%M %p')
-        except ValueError:
-            raise InvalidInputError("Invalid time format. Please use format like '05:00 PM'")
+        time_str = event_details['time']
+        time_parts = time_str.split()
+        hour_min = time_parts[0].split(':')
+        hour = int(hour_min[0])
+        minute = int(hour_min[1]) if len(hour_min) > 1 else 0
+        period = time_parts[1]
         
-        # Determine the event date
-        if 'date' in event_details:
-            try:
-                event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
-            except ValueError:
-                raise InvalidInputError("Invalid date format. Please use YYYY-MM-DD format")
-        else:
-            # Use the day of week to determine date
-            today = datetime.now(pytz.timezone(user_timezone))
-            day_mapping = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
-            target_day = day_mapping[event_details['day']]
-            
-            # Calculate days until target day
-            days_ahead = (target_day - today.weekday()) % 7
-            
-            # If today is the target day and it's already past the specified time, schedule for next week
-            if days_ahead == 0 and today.hour > time_obj.hour:
-                days_ahead = 7
-            
-            event_date = today + timedelta(days=days_ahead)
+        # Convert to 24-hour format
+        if period == 'PM' and hour != 12:
+            hour += 12
+        elif period == 'AM' and hour == 12:
+            hour = 0
         
-        # Combine date and time
-        start_datetime = datetime.combine(
-            event_date.date(), 
-            time_obj.time()
+        # Create datetime object for preferred start time in user's timezone
+        preferred_start = event_date.replace(hour=hour, minute=minute)
+        
+        # Calculate total duration including travel time
+        duration = event_details.get('duration', 30)
+        travel_time = event_details.get('travel_time', 0)
+        total_duration = duration + travel_time
+        
+        # Set time constraints if specified
+        min_time = None
+        max_time = None
+        if 'time_constraints' in event_details:
+            constraints = event_details['time_constraints']
+            if 'min' in constraints:
+                min_time = event_date.replace(
+                    hour=constraints['min']['hour'],
+                    minute=constraints['min']['minute']
+                )
+            if 'max' in constraints:
+                max_time = event_date.replace(
+                    hour=constraints['max']['hour'],
+                    minute=constraints['max']['minute']
+                )
+        
+        # Find available time slot
+        start_time = time_slot_manager.find_available_slot(
+            event_date.date(),
+            total_duration,
+            preferred_start,
+            min_time,
+            max_time
         )
         
-        # Add timezone information
-        start_datetime = pytz.timezone(user_timezone).localize(start_datetime)
+        if not start_time:
+            raise Exception("No available time slot found that meets the constraints")
+        
+        # Adjust for travel time
+        if travel_time:
+            start_time = start_time - timedelta(minutes=travel_time)
         
         # Calculate end time
-        end_datetime = start_datetime + timedelta(minutes=event_details['duration'])
+        end_time = start_time + timedelta(minutes=total_duration)
         
-        # Format for API
-        event_data = {
+        # Convert times to UTC for Google Calendar
+        utc = pytz.UTC
+        start_time_utc = start_time.astimezone(utc)
+        end_time_utc = end_time.astimezone(utc)
+        
+        # Create event in Google Calendar
+        event = {
             'summary': event_details['title'],
             'start': {
-                'dateTime': start_datetime.isoformat(),
-                'timeZone': user_timezone
+                'dateTime': start_time_utc.isoformat(),
+                'timeZone': 'UTC',
             },
             'end': {
-                'dateTime': end_datetime.isoformat(),
-                'timeZone': user_timezone
+                'dateTime': end_time_utc.isoformat(),
+                'timeZone': 'UTC',
             },
-            'colorId': event_details.get('color_id', '1'),  # Default to blue
-            'reminders': {
-                'useDefault': True
-            }
+            'description': f"Duration: {duration} minutes" + \
+                         (f"\nTravel time: {travel_time} minutes" if travel_time else "")
         }
         
-        # Add description if provided
-        if 'description' in event_details:
-            event_data['description'] = event_details['description']
+        # Add any constraints to the description
+        if 'constraints' in event_details:
+            event['description'] += f"\nConstraints: {event_details['constraints']}"
         
-        # Add location if provided
-        if 'location' in event_details:
-            event_data['location'] = event_details['location']
+        created_event = calendar_service.events().insert(calendarId='primary', body=event).execute()
         
-        # Create the event
-        created_event = calendar_service.events().insert(
-            calendarId='primary',
-            body=event_data
-        ).execute()
+        # Add the time slot to the manager (using local time)
+        time_slot_manager.add_time_slot(
+            event_date.date(),
+            start_time,
+            end_time,
+            created_event['id']
+        )
         
-        return start_datetime, end_datetime, created_event.get('htmlLink'), None
+        return start_time, end_time, created_event.get('htmlLink'), None
         
-    except InvalidInputError as e:
-        raise
     except Exception as e:
-        # Check for specific API errors
-        error_message = str(e).lower()
-        if "invalid_grant" in error_message:
-            raise AuthenticationError("Your Google Calendar access has expired")
-        elif "quota" in error_message:
-            raise APILimitError("Calendar API limit reached")
-        else:
-            raise Exception(f"Error scheduling event: {str(e)}")
-     
+        raise Exception(f"Error scheduling event: {str(e)}")
+
 def edit_event(event_details, calendar_service):
     """Edit an existing event with improved handling."""
     try:
@@ -1255,89 +1364,3 @@ def parse_schedule_prompt(prompt):
         duration = int(duration_match.group(1))
     
     return task_name, day, time_str, duration
-
-def process_calendar_request(user_text, gemini_model, calendar_service):
-    """
-    Process a user's calendar request with improved handling.
-    Returns a tuple of (success, response_message).
-    """
-    try:
-        # Parse natural language input
-        event_details = parse_natural_language(user_text, gemini_model)
-        
-        # Log the parsed intent for debugging (you might want to remove this in production)
-        print(f"Parsed intent: {event_details}")
-        
-        # If we couldn't parse the intent clearly, ask for clarification
-        if event_details['action'] == 'UNKNOWN':
-            return True, event_details.get('clarification', 
-                "I'm not sure what you'd like to do with your calendar. Could you rephrase that?")
-        
-        # Validate the extracted information
-        try:
-            event_details = validate_event_details(event_details)
-        except InvalidInputError as e:
-            return False, f"I need a bit more information: {str(e)}"
-        
-        # Handle the calendar action
-        try:
-            start_time, end_time, event_link, response_message = handle_calendar_action(
-                event_details, 
-                calendar_service
-            )
-            
-            # If we got a direct response message, return it
-            if response_message:
-                return True, response_message
-                
-            # Otherwise, build an appropriate response based on the action type
-            if event_details['action'] == 'CREATE':
-                # Format start time for display
-                formatted_start = start_time.strftime('%A, %B %d at %I:%M %p')
-                
-                # Calculate duration for display
-                hours = event_details['duration'] // 60
-                minutes = event_details['duration'] % 60
-                
-                if hours > 0 and minutes > 0:
-                    duration_str = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
-                elif hours > 0:
-                    duration_str = f"{hours} hour{'s' if hours != 1 else ''}"
-                else:
-                    duration_str = f"{minutes} minute{'s' if minutes != 1 else ''}"
-                
-                response = f"✅ I've scheduled '{event_details['title']}' for {formatted_start} ({duration_str})"
-                
-                if event_link:
-                    response += f"\n\nYou can view or edit this event here: {event_link}"
-                    
-                return True, response
-                
-            elif event_details['action'] == 'EDIT':
-                response = f"✅ Your event has been updated successfully"
-                
-                if event_link:
-                    response += f"\n\nYou can view the updated event here: {event_link}"
-                    
-                return True, response
-                
-            elif event_details['action'] == 'DELETE':
-                return True, f"✅ I've deleted the event '{event_details.get('original_title', 'specified event')}' from your calendar."
-                
-            else:
-                return False, "Something went wrong. Please try again."
-                
-        except EventNotFoundError:
-            return False, f"I couldn't find an event matching '{event_details.get('original_title', '')}'. Could you provide more details?"
-            
-        except AuthenticationError:
-            return False, "It looks like your Google Calendar connection needs to be refreshed. Please reconnect your account."
-            
-        except APILimitError:
-            return False, "We've reached the limit of Google Calendar API requests. Please try again in a few minutes."
-            
-        except Exception as e:
-            return False, f"I encountered an error: {str(e)}"
-            
-    except Exception as e:
-        return False, f"Something unexpected happened. Please try again with a simpler request. Error details: {str(e)}"
