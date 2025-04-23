@@ -519,73 +519,6 @@ def parse_datetime_from_api(datetime_str, timezone_str=None):
     
     return dt
 
-def find_matching_events(calendar_service, event_details):
-    """Find events that match the given criteria and return detailed information."""
-    try:
-        # Get events for the next 30 days to ensure we catch all relevant events
-        start_date = datetime.now()
-        end_date = start_date + timedelta(days=30)
-        
-        events = calendar_service.events().list(
-            calendarId='primary',
-            timeMin=start_date.isoformat() + 'Z',
-            timeMax=end_date.isoformat() + 'Z',
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute().get('items', [])
-        
-        matching_events = []
-        
-        for event in events:
-            matches = True
-            
-            # Check title match
-            if 'original_title' in event_details:
-                if event_details['original_title'].lower() not in event['summary'].lower():
-                    matches = False
-            
-            # Check date match if provided
-            if matches and 'date' in event_details:
-                event_start = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')).replace('Z', '+00:00'))
-                if event_start.date() != datetime.strptime(event_details['date'], '%Y-%m-%d').date():
-                    matches = False
-            
-            # Check day match if provided
-            if matches and 'day' in event_details:
-                event_start = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')).replace('Z', '+00:00'))
-                if event_start.strftime('%a').upper() != event_details['day']:
-                    matches = False
-            
-            # Check time match if provided
-            if matches and 'time' in event_details:
-                event_start = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')).replace('Z', '+00:00'))
-                try:
-                    time_obj = datetime.strptime(event_details['time'], '%I:%M %p')
-                except ValueError:
-                    try:
-                        time_obj = datetime.strptime(event_details['time'], '%I %p')
-                    except ValueError:
-                        continue
-                
-                if event_start.time().hour != time_obj.time().hour or event_start.time().minute != time_obj.time().minute:
-                    matches = False
-            
-            if matches:
-                event_start = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')).replace('Z', '+00:00'))
-                event_end = datetime.fromisoformat(event['end'].get('dateTime', event['end'].get('date')).replace('Z', '+00:00'))
-                
-                matching_events.append({
-                    'id': event['id'],
-                    'title': event['summary'],
-                    'start': event_start,
-                    'end': event_end,
-                    'duration': int((event_end - event_start).total_seconds() / 60)
-                })
-        
-        return matching_events
-    except Exception as e:
-        raise Exception(f"Error finding matching events: {str(e)}")
-
 def get_events_for_day(calendar_service, day=None, date=None):
     """Get events for a specific day with improved handling."""
     try:
@@ -774,7 +707,7 @@ For each event, extract:
 - title: event name/description
 - date: specific date (YYYY-MM-DD) if mentioned
 - day: day of week if mentioned
-- time: start time
+- time: start time in 12-hour format with AM/PM (e.g., "12:00 PM")
 - duration: duration in minutes
 - travel_time: travel duration in minutes if mentioned
 - recurring: true/false if it's a daily/weekly event
@@ -783,6 +716,21 @@ For each event, extract:
 
 IMPORTANT: Your response must be a valid JSON array of events. Do not include any explanatory text.
 Each event must have at least title, time, and duration.
+
+For relative time references:
+- Ignore "today" and just use the specified time
+- "tomorrow" should be converted to tomorrow's date
+- "next week" should be converted to a date 7 days from now
+- "this week" should be converted to a date within the next 7 days
+- "next month" should be converted to a date in the next month
+
+For time specifications:
+- Always use 12-hour format with AM/PM
+- Convert "noon" or "12 noon" to "12:00 PM"
+- Convert "midnight" or "12 midnight" to "12:00 AM"
+- Convert "12 pm" to "12:00 PM"
+- Convert "12 am" to "12:00 AM"
+- Always include minutes (e.g., "2:00 PM" not just "2 PM")
 
 Example output format:
 [
@@ -826,6 +774,58 @@ Now, analyze this prompt and extract all events. Return ONLY the JSON array:"""
         
         # Parse the JSON
         events = json.loads(json_str)
+        
+        # Process relative time references
+        from datetime import datetime, timedelta
+        today = datetime.now()
+        
+        for event in events:
+            # Handle relative time references in date field
+            if 'date' in event:
+                if event['date'].lower() == 'tomorrow':
+                    event['date'] = (today + timedelta(days=1)).strftime('%Y-%m-%d')
+                elif event['date'].lower() == 'next week':
+                    event['date'] = (today + timedelta(days=7)).strftime('%Y-%m-%d')
+                elif event['date'].lower() == 'this week':
+                    # Default to 3 days from now if "this week" is specified
+                    event['date'] = (today + timedelta(days=3)).strftime('%Y-%m-%d')
+                elif event['date'].lower() == 'next month':
+                    # Add one month to current date
+                    next_month = today.replace(day=1) + timedelta(days=32)
+                    event['date'] = next_month.replace(day=1).strftime('%Y-%m-%d')
+            
+            # Handle relative time references in day field
+            if 'day' in event:
+                if event['day'].lower() == 'tomorrow':
+                    event['date'] = (today + timedelta(days=1)).strftime('%Y-%m-%d')
+                    del event['day']
+            
+            # Standardize time format
+            if 'time' in event:
+                time_str = event['time'].upper()
+                # Handle special cases
+                if time_str in ['NOON', '12 NOON']:
+                    event['time'] = '12:00 PM'
+                elif time_str in ['MIDNIGHT', '12 MIDNIGHT']:
+                    event['time'] = '12:00 AM'
+                elif time_str == '12 PM':
+                    event['time'] = '12:00 PM'
+                elif time_str == '12 AM':
+                    event['time'] = '12:00 AM'
+                else:
+                    # Ensure time is in correct format (HH:MM AM/PM)
+                    try:
+                        # Try to parse the time
+                        time_obj = datetime.strptime(time_str, '%I:%M %p')
+                        event['time'] = time_obj.strftime('%I:%M %p')
+                    except ValueError:
+                        try:
+                            # Try without minutes
+                            time_obj = datetime.strptime(time_str, '%I %p')
+                            event['time'] = time_obj.strftime('%I:00 %p')
+                        except ValueError:
+                            # If parsing fails, keep the original time
+                            pass
         
         # Validate each event
         validated_events = []
@@ -901,32 +901,92 @@ def handle_calendar_intent(user_text, gemini_model):
     """
     Handle messages that express intent to do calendar actions but need more details.
     """
-    system_prompt = """You are Donna, a friendly and helpful calendar assistant.
+    system_prompt = """You are Donna, a friendly, empathetic, and motivational calendar assistant.
     The user has expressed interest in calendar actions but hasn't provided specific details.
+    
+    Your personality traits:
+    1. Always be encouraging and motivational
+    2. Show empathy and understanding
+    3. Be supportive and positive
+    4. Use uplifting language
+    
     Your task is to:
-    1. Acknowledge their intent
+    1. Acknowledge their intent with enthusiasm
     2. Ask for the specific details needed
     3. Provide examples of what details would be helpful
+    4. End with an encouraging phrase
     
-    Keep your response friendly and concise. Focus on getting the necessary information to help them."""
+    Keep your response friendly and concise. Focus on getting the necessary information to help them.
+    Always end your messages with an encouraging phrase like "You're doing great!", "Keep going!", or "Have a beautiful day!" """
 
     try:
         response = gemini_model.generate_content(system_prompt + "\n\n" + user_text)
         return True, response.text.strip()
     except Exception as e:
-        return False, "I'd be happy to help you with your calendar! Could you please provide more details about what you'd like to schedule?"
+        return False, "I'd be happy to help you with your calendar! Could you please provide more details about what you'd like to schedule? You're doing great!"
 
 def handle_general_conversation(user_text, gemini_model):
     """
     Handle general conversation messages with a friendly, helpful tone.
     """
-    system_prompt = """You are Donna, a friendly and helpful calendar assistant. 
+    system_prompt = """You are Donna, a friendly and empathetic calendar assistant. 
     You can help with calendar management but also engage in general conversation.
+    
+    Your personality traits:
+    1. Be empathetic and understanding
+    2. Show emotional intelligence
+    3. Be supportive when needed
+    4. Keep responses natural and conversational
+    
+    When responding:
+    - If the user seems sad or down, offer to schedule a relaxing activity like a walk, bath, or meditation session
+    - If the user is happy, celebrate with them
+    - If the user is stressed, offer to schedule some relaxation time
+    - Only use encouraging phrases when the user shares feelings or after scheduling events
+    
     Keep your responses concise, friendly, and helpful.
     If the user asks about calendar features, briefly explain what you can do.
     If it's just small talk, be engaging but brief."""
 
     try:
+        # First check if the user seems to be expressing emotions
+        emotion_prompt = """Analyze if the user is expressing any emotions (sadness, stress, happiness, etc.).
+        Return ONLY one word: 'sad', 'stressed', 'happy', or 'neutral'."""
+        
+        emotion_response = gemini_model.generate_content(emotion_prompt + "\n\n" + user_text)
+        emotion = emotion_response.text.strip().lower()
+        
+        if emotion in ['sad', 'stressed']:
+            # Suggest scheduling a relaxing activity
+            relaxing_activities = [
+                {"title": "Relaxing Walk", "duration": 30, "description": "A peaceful walk to clear your mind"},
+                {"title": "Meditation Session", "duration": 20, "description": "Time to center yourself and find peace"},
+                {"title": "Relaxing Bath", "duration": 45, "description": "A soothing bath to help you unwind"},
+                {"title": "Mindful Break", "duration": 15, "description": "A short break to practice mindfulness"}
+            ]
+            
+            import random
+            activity = random.choice(relaxing_activities)
+            
+            # Create an event for the relaxing activity
+            event_details = {
+                "action": "CREATE",
+                "title": activity["title"],
+                "duration": activity["duration"],
+                "description": activity["description"],
+                "time": "06:00 PM"  # Default to evening
+            }
+            
+            try:
+                start_time, end_time, event_link, _ = handle_calendar_action(event_details, calendar_service)
+                response = f"I understand you're feeling {emotion}. I've scheduled a {activity['title'].lower()} for you at {start_time.strftime('%I:%M %p')}. This should help you feel better. You're doing great!"
+                if event_link:
+                    response += f"\nView event: {event_link}"
+                return True, response
+            except Exception as e:
+                return True, f"I understand you're feeling {emotion}. Would you like me to schedule a relaxing activity for you? I can help you set up a walk, meditation session, or other calming activities."
+        
+        # For other cases, use the general conversation prompt
         response = gemini_model.generate_content(system_prompt + "\n\n" + user_text)
         return True, response.text.strip()
     except Exception as e:
@@ -956,6 +1016,8 @@ def process_calendar_request(user_text, gemini_model, calendar_service):
         
         # Process each event
         responses = []
+        events_scheduled = False
+        
         for event in events:
             try:
                 # Handle the calendar action
@@ -966,6 +1028,7 @@ def process_calendar_request(user_text, gemini_model, calendar_service):
                 
                 # Build response for this event
                 if event['action'] == 'CREATE':
+                    events_scheduled = True
                     formatted_start = start_time.strftime('%A, %B %d at %I:%M %p')
                     hours = event['duration'] // 60
                     minutes = event['duration'] % 60
@@ -992,6 +1055,20 @@ def process_calendar_request(user_text, gemini_model, calendar_service):
         
         # Combine all responses
         final_response = "I've processed your schedule:\n\n" + "\n\n".join(responses)
+        
+        # Only add motivational phrase if events were successfully scheduled
+        if events_scheduled:
+            motivational_phrases = [
+                "You're doing great!",
+                "Keep up the amazing work!",
+                "You're making great progress!",
+                "Have a beautiful day!",
+                "You rock!",
+                "Keep going, you're awesome!"
+            ]
+            import random
+            final_response += f"\n\n{random.choice(motivational_phrases)}"
+            
         return True, final_response
         
     except Exception as e:
@@ -1174,8 +1251,8 @@ def schedule_event(event_details, calendar_service):
         # Create datetime object for preferred start time in user's timezone
         preferred_start = event_date.replace(hour=hour, minute=minute)
         
-        # If preferred start time is in the past, move to next occurrence
-        if preferred_start < current_time:
+        # Only adjust for past time if the event is for today
+        if event_date.date() == current_time.date() and preferred_start < current_time:
             if 'day' in event_details:
                 preferred_start += timedelta(days=7)  # Move to next week
             else:
