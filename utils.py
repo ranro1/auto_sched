@@ -6,6 +6,7 @@ import os
 from google_calendar import add_event_to_calendar, get_week_events
 import pytz
 from difflib import SequenceMatcher
+import random
 
 
 def validate_event_details(event_details):
@@ -168,10 +169,58 @@ def standardize_time_format(time_str):
 def standardize_date_format(date_str):
     """
     Standardize date format to 'YYYY-MM-DD'.
-    Accepts various input formats like 'MM/DD', 'MM-DD-YYYY', etc.
+    Accepts various input formats including relative time expressions.
     """
-    # Remove whitespace
-    date_str = date_str.strip()
+    # Remove whitespace and convert to lowercase
+    date_str = date_str.strip().lower()
+    
+    # Get current date in user's timezone
+    user_timezone = get_user_timezone()
+    local_tz = pytz.timezone(user_timezone)
+    today = datetime.now(local_tz)
+    
+    # Handle relative time expressions
+    relative_dates = {
+        'today': 0,
+        'tomorrow': 1,
+        'yesterday': -1,
+        'next week': 7,
+        'last week': -7,
+        'next month': 30,
+        'last month': -30
+    }
+    
+    # Check for "in X days/weeks/months" format
+    in_pattern = re.compile(r'in\s+(\d+)\s+(day|week|month)s?')
+    in_match = in_pattern.match(date_str)
+    if in_match:
+        number = int(in_match.group(1))
+        unit = in_match.group(2)
+        if unit == 'day':
+            days = number
+        elif unit == 'week':
+            days = number * 7
+        else:  # month
+            days = number * 30
+        return (today + timedelta(days=days)).strftime('%Y-%m-%d')
+    
+    # Check for "X days/weeks/months ago" format
+    ago_pattern = re.compile(r'(\d+)\s+(day|week|month)s?\s+ago')
+    ago_match = ago_pattern.match(date_str)
+    if ago_match:
+        number = int(ago_match.group(1))
+        unit = ago_match.group(2)
+        if unit == 'day':
+            days = -number
+        elif unit == 'week':
+            days = -number * 7
+        else:  # month
+            days = -number * 30
+        return (today + timedelta(days=days)).strftime('%Y-%m-%d')
+    
+    # Check for simple relative dates
+    if date_str in relative_dates:
+        return (today + timedelta(days=relative_dates[date_str])).strftime('%Y-%m-%d')
     
     # Try different date formats
     formats = [
@@ -186,14 +235,6 @@ def standardize_date_format(date_str):
         '%d %b'      # 31 Dec
     ]
     
-    # Special case for today, tomorrow, etc.
-    if date_str.lower() == 'today':
-        return datetime.now().strftime('%Y-%m-%d')
-    elif date_str.lower() == 'tomorrow':
-        return (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-    elif date_str.lower() == 'yesterday':
-        return (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    
     # Try each format
     for fmt in formats:
         try:
@@ -201,11 +242,11 @@ def standardize_date_format(date_str):
             
             # Set year to current year if not specified
             if '%Y' not in fmt:
-                current_year = datetime.now().year
+                current_year = today.year
                 
                 # If the resulting date is in the past, and it's near the end of year,
                 # assume it's for next year
-                if parsed_date.replace(year=current_year) < datetime.now() and datetime.now().month > 10:
+                if parsed_date.replace(year=current_year) < today and today.month > 10:
                     parsed_date = parsed_date.replace(year=current_year + 1)
                 else:
                     parsed_date = parsed_date.replace(year=current_year)
@@ -831,12 +872,134 @@ def compare_times(time1, time2, tolerance_minutes=5):
     
     return diff_minutes <= tolerance_minutes
 
+def detect_mood(text):
+    """
+    Enhanced mood detection with support for emotional context.
+    Returns a tuple of (mood_type, intensity, context)
+    """
+    # Enhanced mood categories
+    mood_categories = {
+        'positive': ['happy', 'great', 'excited', 'good', 'wonderful', 'amazing', 'fantastic', 'love', 'enjoy', 'looking forward'],
+        'negative': ['sad', 'down', 'tired', 'stressed', 'overwhelmed', 'exhausted', 'frustrated', 'anxious', 'worried', 'depressed'],
+        'neutral': ['okay', 'fine', 'alright', 'normal', 'usual']
+    }
+    
+    # Supportive context keywords
+    support_context = {
+        'need_break': ['tired', 'exhausted', 'overwhelmed', 'stressed', 'burned out'],
+        'need_activity': ['bored', 'restless', 'stuck', 'unmotivated'],
+        'need_support': ['sad', 'down', 'depressed', 'lonely', 'anxious']
+    }
+    
+    text = text.lower()
+    mood_scores = {mood: 0 for mood in mood_categories}
+    context_scores = {context: 0 for context in support_context}
+    
+    # Calculate mood scores
+    for mood, keywords in mood_categories.items():
+        for keyword in keywords:
+            if keyword in text:
+                mood_scores[mood] += 1
+    
+    # Calculate context scores
+    for context, keywords in support_context.items():
+        for keyword in keywords:
+            if keyword in text:
+                context_scores[context] += 1
+    
+    # Find dominant mood
+    max_mood_score = max(mood_scores.values())
+    if max_mood_score == 0:
+        return 'neutral', 0.0, None
+    
+    dominant_mood = max(mood_scores.items(), key=lambda x: x[1])[0]
+    intensity = min(1.0, max_mood_score / 3)  # Normalize intensity
+    
+    # Determine context
+    max_context_score = max(context_scores.values())
+    if max_context_score > 0:
+        dominant_context = max(context_scores.items(), key=lambda x: x[1])[0]
+    else:
+        dominant_context = None
+    
+    return dominant_mood, intensity, dominant_context
+
+def get_supportive_response(mood_type, intensity, context=None):
+    """
+    Generate supportive responses based on mood and context.
+    """
+    # Supportive responses for different moods
+    supportive_responses = {
+        'negative': [
+            "I notice you're feeling down. Would you like to schedule some self-care time?",
+            "It's important to take care of yourself. How about scheduling a relaxing activity?",
+            "I'm here to support you. Would you like to plan something to help you feel better?"
+        ],
+        'positive': [
+            "I'm glad you're feeling good! Would you like to schedule something to maintain this positive energy?",
+            "That's wonderful to hear! Would you like to plan something to celebrate this mood?",
+            "Your positive attitude is inspiring! Would you like to schedule something to keep this momentum going?"
+        ],
+        'neutral': [
+            "How are you feeling today? I'm here to support you!",
+            "Is there anything specific you'd like to focus on?",
+            "Remember, I'm here to help you stay organized and motivated!"
+        ]
+    }
+    
+    # Wellness activities based on context
+    wellness_activities = {
+        'need_break': [
+            {"title": "Relaxing Bath", "duration": 45, "description": "Time to unwind and relax"},
+            {"title": "Meditation Session", "duration": 30, "description": "A peaceful moment to center yourself"},
+            {"title": "Mindful Break", "duration": 20, "description": "A short break to practice mindfulness"}
+        ],
+        'need_activity': [
+            {"title": "Gentle Walk", "duration": 30, "description": "A refreshing walk to clear your mind"},
+            {"title": "Light Stretching", "duration": 20, "description": "Some gentle stretches to energize your body"},
+            {"title": "Fresh Air Break", "duration": 15, "description": "A short break to get some fresh air"}
+        ],
+        'need_support': [
+            {"title": "Self-Care Time", "duration": 60, "description": "Dedicated time for self-care and relaxation"},
+            {"title": "Creative Break", "duration": 45, "description": "Time to engage in a creative activity"},
+            {"title": "Nature Connection", "duration": 30, "description": "Time to connect with nature and find peace"}
+        ]
+    }
+    
+    # Get base response
+    base_responses = supportive_responses.get(mood_type, supportive_responses['neutral'])
+    response = random.choice(base_responses)
+    
+    # Add activity suggestions for negative moods
+    if mood_type == 'negative' and context in wellness_activities:
+        activities = wellness_activities[context]
+        activity = random.choice(activities)
+        response += f"\n\nI can suggest some activities that might help:\n"
+        for i, act in enumerate(activities, 1):
+            response += f"{i}. {act['title']} ({act['duration']} minutes) - {act['description']}\n"
+        response += "\nWould you like to schedule any of these activities?"
+    
+    return response
+
 def process_calendar_request(user_text, gemini_model, calendar_service, context=None):
     """
-    Process a user's calendar request with conversational flow and context awareness.
+    Process a user's calendar request with enhanced emotional support.
     Returns a tuple of (success, response_message).
     """
     try:
+        # Detect mood and context first
+        mood_type, intensity, support_context = detect_mood(user_text)
+        
+        # If user is expressing emotions without a specific calendar request
+        if mood_type == 'negative' and intensity > 0.3:  # Lower threshold for emotional support
+            # Get supportive response
+            supportive_response = get_supportive_response(mood_type, intensity, support_context)
+            
+            # Add a gentle transition to calendar functionality
+            calendar_prompt = "\n\nI'm here to help you manage your schedule as well. Would you like to create, delete, edit, or view any events?"
+            
+            return True, supportive_response + calendar_prompt
+        
         # Use context for better understanding if available
         if context:
             # Extract relevant information from context
@@ -1076,6 +1239,10 @@ def process_calendar_request(user_text, gemini_model, calendar_service, context=
                 )
                 
                 if success:
+                    # Add supportive response if needed
+                    if mood_type == 'negative' and intensity > 0.5:
+                        supportive_response = get_supportive_response(mood_type, intensity, support_context)
+                        response_message += "\n\n" + supportive_response
                     return True, response_message
                 else:
                     return False, f"Failed to process action: {response_message}"
@@ -1105,7 +1272,7 @@ def process_calendar_request(user_text, gemini_model, calendar_service, context=
                         responses.append(response_message)
                     else:
                         responses.append(f"❌ Failed to process action: {response_message}")
-                        
+                    
                 except Exception as e:
                     responses.append(f"❌ Failed to process action: {str(e)}")
             
@@ -1130,17 +1297,12 @@ def schedule_event(event_details, calendar_service):
         
         # Get the event's date and time
         if 'date' in event_details:
+            # Parse the date string to get the date
             event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
             event_date = local_tz.localize(event_date)
         else:
-            today = datetime.now(local_tz)
-            days_ahead = 0
-            while True:
-                current_date = today + timedelta(days=days_ahead)
-                if current_date.strftime('%a').upper()[:3] == event_details['day']:
-                    event_date = current_date
-                    break
-                days_ahead += 1
+            # If no date specified, use today
+            event_date = current_time
         
         # Parse the time
         time_str = event_details['time']
