@@ -262,31 +262,3 @@ def delete_event(event_details, calendar_service):
 def parse_schedule_prompt(prompt):
     """Parse the scheduling prompt to extract event details."""
     import re
-    
-    # Default values
-    task_name = "Meeting"
-    day = None
-    time_str = None
-    duration = 30
-    
-    # Extract task name
-    task_match = re.search(r'([^0-9]+)(?:\s+on|\s+at|\s+for)', prompt, re.IGNORECASE)
-    if task_match:
-        task_name = task_match.group(1).strip()
-    
-    # Extract day
-    day_match = re.search(r'(?:on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)', prompt, re.IGNORECASE)
-    if day_match:
-        day = day_match.group(1).upper()[:3]
-    
-    # Extract time
-    time_match = re.search(r'at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)', prompt, re.IGNORECASE)
-    if time_match:
-        time_str = time_match.group(1)
-    
-    # Extract duration
-    duration_match = re.search(r'for\s+(\d+)\s*(?:min|minutes|mins|hour|hours|hr|hrs)', prompt, re.IGNORECASE)
-    if duration_match:
-        duration = int(duration_match.group(1))
-    
-    return task_name, day, time_str, duration

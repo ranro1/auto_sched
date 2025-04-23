@@ -261,57 +261,64 @@ class ParsingError(CalendarError):
     pass
 
 def handle_calendar_action(event_details, calendar_service):
-    """
-    Handle calendar actions based on the event details.
-    Returns a tuple of (success, response_message)
-    """
+    """Handle calendar actions with support for multiple events and dependencies."""
     try:
-        # Validate event details first
-        validated_details = validate_event_details(event_details)
-        
-        # Handle different actions
-        if validated_details['action'] == 'CREATE':
-            # Check if this is a multiple event creation
-            if 'multiple_events' in validated_details and validated_details['multiple_events']:
-                return schedule_multiple_events(validated_details, calendar_service)
-            else:
-                return schedule_event(validated_details, calendar_service)
+        if event_details['action'] == 'CREATE':
+            # For recurring events, create multiple events
+            if event_details.get('recurring'):
+                # Get the next 7 days
+                from datetime import datetime, timedelta
+                today = datetime.now()
+                events_created = 0
                 
-        elif validated_details['action'] == 'EDIT':
-            return edit_event(validated_details, calendar_service)
-            
-        elif validated_details['action'] == 'DELETE':
-            return delete_event(validated_details, calendar_service)
-            
-        elif validated_details['action'] == 'VIEW':
-            try:
-                # Get events for the specified day/date
-                events = get_events_for_day(calendar_service, 
-                                          day=validated_details.get('day'),
-                                          date=validated_details.get('date'))
+                for i in range(7):
+                    current_date = today + timedelta(days=i)
+                    # Skip if it's a specific day and doesn't match
+                    if 'day' in event_details:
+                        if current_date.strftime('%a').upper()[:3] != event_details['day']:
+                            continue
+                    
+                    # Create event for this day
+                    event_copy = event_details.copy()
+                    event_copy['date'] = current_date.strftime('%Y-%m-%d')
+                    del event_copy['recurring']
+                    if 'day' in event_copy:
+                        del event_copy['day']
+                    
+                    try:
+                        success, _ = schedule_event(event_copy, calendar_service)
+                        if success:
+                            events_created += 1
+                    except Exception as e:
+                        print(f"Warning: Failed to create recurring event for {current_date}: {str(e)}")
+                        continue
                 
-                if not events:
-                    return True, "No events found for the specified time period."
+                if events_created == 0:
+                    return False, "Failed to create any recurring events"
                 
-                # Format the events for display
-                formatted_events = format_event_details(events)
-                return True, formatted_events
-            except Exception as e:
-                return False, f"Error viewing events: {str(e)}"
+                # Return a simple summary message
+                return True, f"Created recurring event '{event_details['title']}' for the next 7 days at {event_details['time']}"
             
-        elif validated_details['action'] == 'UNKNOWN':
-            return False, validated_details.get('clarification', 
-                "I'm not sure what you want to do with your calendar. Could you be more specific?")
+            # For single events
+            return schedule_event(event_details, calendar_service)
             
-        else:
-            return False, f"Unknown action type: {validated_details['action']}"
+        elif event_details['action'] == 'EDIT':
+            return edit_event(event_details, calendar_service)
             
-    except InvalidInputError as e:
-        return False, str(e)
-    except CalendarError as e:
-        return False, f"Calendar error: {str(e)}"
+        elif event_details['action'] == 'DELETE':
+            return delete_event(event_details, calendar_service)
+            
+        elif event_details['action'] == 'VIEW':
+            events = get_events_for_day(calendar_service, event_details.get('day'), event_details.get('date'))
+            if not events:
+                return True, "You have no events scheduled for this day."
+            return True, format_event_details(events)
+            
+        elif event_details['action'] == 'UNKNOWN':
+            return False, event_details['clarification']
+            
     except Exception as e:
-        return False, f"An unexpected error occurred: {str(e)}"
+        return False, f"Error handling calendar action: {str(e)}"
 
 def calculate_title_similarity(title1, title2):
     """
@@ -618,10 +625,12 @@ For CREATE actions, extract:
 - recurring: true/false if it's a daily/weekly event
 - constraints: any specific constraints mentioned
 
-For VIEW actions, extract:
-- action: "VIEW"
+For DELETE actions, extract:
+- action: "DELETE"
+- original_title: event title to delete
 - date: specific date (YYYY-MM-DD) if mentioned
 - day: day of week if mentioned
+- time: specific time if mentioned
 
 For EDIT actions, extract:
 - action: "EDIT"
@@ -763,6 +772,7 @@ def schedule_event(event_details, calendar_service):
         # Get user's timezone
         user_timezone = get_user_timezone()
         local_tz = pytz.timezone(user_timezone)
+        current_time = datetime.now(local_tz)
         
         # Get the event's date and time
         if 'date' in event_details:
@@ -794,6 +804,10 @@ def schedule_event(event_details, calendar_service):
         
         # Create datetime object for start time in user's timezone
         start_time = event_date.replace(hour=hour, minute=minute)
+        
+        # Skip if the event is in the past
+        if start_time < current_time:
+            return False, f"Skipped scheduling '{event_details['title']}' as it's in the past"
         
         # Calculate total duration including travel time
         duration = event_details.get('duration', 30)
@@ -1006,24 +1020,19 @@ def edit_event(event_details, calendar_service):
             raise Exception(f"Error editing event: {str(e)}")
 
 def delete_event(event_details, calendar_service):
-    """Delete an event with improved error handling."""
+    """Delete an event from Google Calendar."""
     try:
-        # Validate the input first
-        event_details = validate_event_details(event_details)
+        # Find the event to delete
+        events = get_week_events(calendar_service, datetime.now())
+        event_to_delete = None
         
-        # Find matching events
-        matching_events = find_matching_events(calendar_service, event_details)
+        for event in events:
+            if event['summary'].lower() == event_details['original_title'].lower():
+                event_to_delete = event
+                break
         
-        if not matching_events:
-            raise EventNotFoundError("I couldn't find any events matching your description")
-        
-        if len(matching_events) > 1:
-            # Multiple matches found, provide details for selection
-            return False, format_event_details(matching_events) + "\nPlease specify which event you want to delete by providing more specific details."
-        
-        # Get the event to delete
-        event_to_delete = matching_events[0]
-        event_title = event_to_delete['title']
+        if not event_to_delete:
+            return False, f"Could not find event with title: {event_details['original_title']}"
         
         # Delete the event
         calendar_service.events().delete(
@@ -1031,20 +1040,10 @@ def delete_event(event_details, calendar_service):
             eventId=event_to_delete['id']
         ).execute()
         
-        return True, f"I've deleted '{event_title}' from your calendar."
+        return True, f"I've deleted '{event_details['original_title']}' from your calendar."
         
-    except EventNotFoundError as e:
-        return False, str(e)
-    except InvalidInputError as e:
-        return False, str(e)
     except Exception as e:
-        error_message = str(e).lower()
-        if "invalid_grant" in error_message:
-            return False, "Your Google Calendar access has expired"
-        elif "quota" in error_message:
-            return False, "Google Calendar API limit reached"
-        else:
-            return False, f"Error deleting event: {str(e)}"
+        return False, f"Error deleting event: {str(e)}"
 
 def parse_schedule_prompt(prompt):
 
