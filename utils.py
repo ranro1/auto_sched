@@ -1048,48 +1048,53 @@ def schedule_event(event_details, calendar_service):
         
         # Get the event's date and time
         if 'date' in event_details:
-            event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
-            event_date = user_timezone.localize(event_date)
+            try:
+                event_date = datetime.strptime(event_details['date'], '%Y-%m-%d')
+                event_date = user_timezone.localize(event_date)
+            except ValueError:
+                raise InvalidInputError("Invalid date format. Please use YYYY-MM-DD format")
+        elif 'day' in event_details:
+            # Convert day name to day number (0=Monday, 6=Sunday)
+            day_mapping = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+            target_day = day_mapping.get(event_details['day'].upper())
+            if target_day is None:
+                raise InvalidInputError(f"Invalid day: {event_details['day']}")
             
-            # If the date is in the past, find the next occurrence
-            if event_date < current_time:
-                days_ahead = 1
-                while True:
-                    next_date = current_time + timedelta(days=days_ahead)
-                    if next_date.date() == event_date.date():
-                        event_date = next_date
-                        break
-                    days_ahead += 1
+            # Calculate days until target day
+            days_ahead = (target_day - current_time.weekday()) % 7
+            if days_ahead == 0 and current_time.hour >= 18:  # If it's the same day and after 6 PM
+                days_ahead = 7  # Schedule for next week
+            
+            event_date = current_time.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
         else:
-            today = current_time
-            days_ahead = 0
-            while True:
-                current_date = today + timedelta(days=days_ahead)
-                if current_date.strftime('%a').upper()[:3] == event_details['day']:
-                    event_date = current_date
-                    break
-                days_ahead += 1
+            event_date = current_time
         
         # Parse the time
-        time_str = event_details['time']
-        time_parts = time_str.split()
-        hour_min = time_parts[0].split(':')
-        hour = int(hour_min[0])
-        minute = int(hour_min[1]) if len(hour_min) > 1 else 0
-        period = time_parts[1]
-        
-        # Convert to 24-hour format
-        if period == 'PM' and hour != 12:
-            hour += 12
-        elif period == 'AM' and hour == 12:
-            hour = 0
+        try:
+            time_str = event_details['time']
+            time_parts = time_str.split()
+            hour_min = time_parts[0].split(':')
+            hour = int(hour_min[0])
+            minute = int(hour_min[1]) if len(hour_min) > 1 else 0
+            period = time_parts[1].upper()
+            
+            # Convert to 24-hour format
+            if period == 'PM' and hour != 12:
+                hour += 12
+            elif period == 'AM' and hour == 12:
+                hour = 0
+        except (ValueError, IndexError, KeyError):
+            raise InvalidInputError("Invalid time format. Please use format like '06:00 PM'")
         
         # Create datetime object for preferred start time in user's timezone
         preferred_start = event_date.replace(hour=hour, minute=minute)
         
-        # If preferred start time is in the past, move to next day
+        # If preferred start time is in the past, move to next occurrence
         if preferred_start < current_time:
-            preferred_start = preferred_start + timedelta(days=1)
+            if 'day' in event_details:
+                preferred_start += timedelta(days=7)  # Move to next week
+            else:
+                preferred_start += timedelta(days=1)  # Move to next day
         
         # Calculate total duration including travel time
         duration = event_details.get('duration', 30)
@@ -1117,7 +1122,7 @@ def schedule_event(event_details, calendar_service):
         
         # Find available time slot
         start_time = time_slot_manager.find_available_slot(
-            event_date.date(),
+            event_date.date(), 
             total_duration,
             preferred_start,
             min_time,
@@ -1170,8 +1175,16 @@ def schedule_event(event_details, calendar_service):
         
         return start_time, end_time, created_event.get('htmlLink'), None
         
+    except InvalidInputError as e:
+        raise
     except Exception as e:
-        raise Exception(f"Error scheduling event: {str(e)}")
+        error_message = str(e).lower()
+        if "invalid_grant" in error_message:
+            raise AuthenticationError("Your Google Calendar access has expired")
+        elif "quota" in error_message:
+            raise APILimitError("Calendar API limit reached")
+        else:
+            raise Exception(f"Error scheduling event: {str(e)}")
 
 def edit_event(event_details, calendar_service):
     """Edit an existing event with improved handling."""
