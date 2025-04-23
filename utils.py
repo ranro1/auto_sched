@@ -1019,7 +1019,7 @@ def delete_event(event_details, calendar_service):
         
         if len(matching_events) > 1:
             # Multiple matches found, provide details for selection
-            return None, None, None, format_event_details(matching_events) + "\nPlease specify which event you want to delete by providing more specific details."
+            return False, format_event_details(matching_events) + "\nPlease specify which event you want to delete by providing more specific details."
         
         # Get the event to delete
         event_to_delete = matching_events[0]
@@ -1031,20 +1031,20 @@ def delete_event(event_details, calendar_service):
             eventId=event_to_delete['id']
         ).execute()
         
-        return None, None, None, f"I've deleted '{event_title}' from your calendar."
+        return True, f"I've deleted '{event_title}' from your calendar."
         
     except EventNotFoundError as e:
-        raise
+        return False, str(e)
     except InvalidInputError as e:
-        raise
+        return False, str(e)
     except Exception as e:
         error_message = str(e).lower()
         if "invalid_grant" in error_message:
-            raise AuthenticationError("Your Google Calendar access has expired")
+            return False, "Your Google Calendar access has expired"
         elif "quota" in error_message:
-            raise APILimitError("Calendar API limit reached")
+            return False, "Google Calendar API limit reached"
         else:
-            raise Exception(f"Error deleting event: {str(e)}")
+            return False, f"Error deleting event: {str(e)}"
 
 def parse_schedule_prompt(prompt):
 

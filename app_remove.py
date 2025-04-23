@@ -7,7 +7,7 @@ import os
 from dotenv import load_dotenv
 from google_calendar import get_google_calendar_service
 import time
-from utils import parse_natural_language, handle_calendar_action, process_calendar_request
+from utils import parse_natural_language, handle_calendar_action
 
 
 # Load environment variables
@@ -27,7 +27,7 @@ if 'calendar_service' not in st.session_state:
         st.stop()
 
 # Set page config
-st.set_page_config(layout="wide", page_title="Donna")
+st.set_page_config(layout="wide", page_title="My Private Scheduler")
 
 # Load external CSS
 with open('style.css') as f:
@@ -36,7 +36,7 @@ with open('style.css') as f:
 # Initialize session state for chat history
 if 'messages' not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hello! I'm Donna, your friendly calendar assistant. How can I help you manage your schedule today?"}
+        {"role": "assistant", "content": "Hello! I'm your friendly calendar assistant. How can I help you manage your schedule today?"}
     ]
 
 
@@ -54,38 +54,53 @@ col1, col2 = st.columns([1, 2])
 
 # Left column - Chat interface
 with col1:
+    
     # Title
-    st.markdown('<div class="chat-title">Donna</div>', unsafe_allow_html=True)
+    st.markdown('<div class="chat-title">Schedule Assistant</div>', unsafe_allow_html=True)
 
-    # Create a container for chat messages with fixed height
-    chat_container = st.container(height=700)  # Using a larger pixel value to fill most of the screen
+    # st.markdown('<div class="chat-container">', unsafe_allow_html=True)
     
-    # Display chat history in the container
-    with chat_container:
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.write(message["content"])
+    # Messages container
+    st.markdown('<div class="chat-messages-container">', unsafe_allow_html=True)
+    for message in st.session_state.messages:
+        message_class = "user-message" if message["role"] == "user" else "assistant-message"
+        st.markdown(
+            f'<div class="message {message_class}">{message["content"]}</div>',
+            unsafe_allow_html=True
+        )
+    st.markdown('</div>', unsafe_allow_html=True)
     
-    # Chat input at the bottom
+    # Input container
+    st.markdown('<div class="chat-input-container">', unsafe_allow_html=True)
     if prompt := st.chat_input("What would you like to do with your calendar?"):
         if prompt != st.session_state.last_prompt:
             st.session_state.last_prompt = prompt
             st.session_state.messages.append({"role": "user", "content": prompt})
             
             try:
-                # Process the calendar request using the new function
-                success, response = process_calendar_request(prompt, model, st.session_state.calendar_service)
+                event_details = parse_natural_language(prompt, model)
+                start_datetime, end_datetime, event_link, clarification = handle_calendar_action(event_details, st.session_state.calendar_service)
                 
-                # Add the response to the chat history
+                if clarification:
+                    response = clarification
+                else:
+                    if event_details['action'] == 'CREATE':
+                        response = f"Scheduled {event_details['title']} on {event_details['day']} from {start_datetime.strftime('%I:%M %p')} to {end_datetime.strftime('%I:%M %p')}"
+                    elif event_details['action'] == 'EDIT':
+                        response = f"Updated event: {event_details['original_title']} -> {event_details.get('new_title', event_details['original_title'])}"
+                    elif event_details['action'] == 'DELETE':
+                        response = f"Deleted event: {event_details['original_title']}"
+                
                 st.session_state.messages.append({"role": "assistant", "content": response})
-                
-                # Only refresh if the request was successful
-                if success:
-                    st.rerun()
+                st.rerun()
             except Exception as e:
-                error_msg = f"I'm having trouble understanding your request. Could you please rephrase it? Error: {str(e)}"
+                error_msg = f"I couldn't complete your request. Error: {str(e)}"
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
                 st.rerun()
+    
+    # st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
 
 
 # Right column - Google Calendar view
