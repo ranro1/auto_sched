@@ -73,17 +73,17 @@ with col1:
             st.session_state.messages.append({"role": "user", "content": prompt})
             
             try:
-                # Process the calendar request using the new function
+                # Process the message using the updated function
                 success, response = process_calendar_request(prompt, model, st.session_state.calendar_service)
                 
                 # Add the response to the chat history
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 
-                # Only refresh if the request was successful and it was a calendar action
+                # Only refresh if the request was successful
                 if success:
                     st.rerun()
             except Exception as e:
-                error_msg = f"I'm having trouble understanding your request. Could you please rephrase it? Error: {str(e)}"
+                error_msg = "I'm having trouble understanding your request. Could you please try again?"
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
                 st.rerun()
 

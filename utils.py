@@ -856,19 +856,103 @@ Now, analyze this prompt and extract all events. Return ONLY the JSON array:"""
             'clarification': "I'm having trouble understanding your schedule. Could you break it down into simpler, separate events?"
         }]
 
+def detect_message_type(user_text, gemini_model):
+    """
+    Determine if the message is a calendar action, calendar intent, or general conversation.
+    Returns: 'calendar_action', 'calendar_intent', or 'general_conversation'
+    """
+    system_prompt = """You are an expert at determining the type of message.
+    Return ONLY one of these three words:
+    
+    'calendar_action' if the message contains specific calendar details like:
+    - Specific time (e.g., "at 2pm", "tomorrow at 3")
+    - Specific date (e.g., "on Monday", "next week")
+    - Specific duration (e.g., "for 1 hour", "30 minutes")
+    - Complete event details
+    
+    'calendar_intent' if the message expresses intent to do calendar actions but lacks specific details:
+    - "I want to schedule some meetings"
+    - "Can you help me set up appointments?"
+    - "I need to plan my week"
+    - Any general calendar-related request without specific details
+    
+    'general_conversation' if the message is:
+    - Greetings (hi, hello, etc.)
+    - General questions
+    - Small talk
+    - Non-calendar related topics
+    
+    Your response should be exactly one of these three words."""
+
+    try:
+        response = gemini_model.generate_content(system_prompt + "\n\n" + user_text)
+        message_type = response.text.strip().lower()
+        
+        if message_type not in ['calendar_action', 'calendar_intent', 'general_conversation']:
+            # Default to general conversation if unsure
+            return 'general_conversation'
+            
+        return message_type
+    except Exception as e:
+        # Default to general conversation if there's an error
+        return 'general_conversation'
+
+def handle_calendar_intent(user_text, gemini_model):
+    """
+    Handle messages that express intent to do calendar actions but need more details.
+    """
+    system_prompt = """You are Donna, a friendly and helpful calendar assistant.
+    The user has expressed interest in calendar actions but hasn't provided specific details.
+    Your task is to:
+    1. Acknowledge their intent
+    2. Ask for the specific details needed
+    3. Provide examples of what details would be helpful
+    
+    Keep your response friendly and concise. Focus on getting the necessary information to help them."""
+
+    try:
+        response = gemini_model.generate_content(system_prompt + "\n\n" + user_text)
+        return True, response.text.strip()
+    except Exception as e:
+        return False, "I'd be happy to help you with your calendar! Could you please provide more details about what you'd like to schedule?"
+
+def handle_general_conversation(user_text, gemini_model):
+    """
+    Handle general conversation messages with a friendly, helpful tone.
+    """
+    system_prompt = """You are Donna, a friendly and helpful calendar assistant. 
+    You can help with calendar management but also engage in general conversation.
+    Keep your responses concise, friendly, and helpful.
+    If the user asks about calendar features, briefly explain what you can do.
+    If it's just small talk, be engaging but brief."""
+
+    try:
+        response = gemini_model.generate_content(system_prompt + "\n\n" + user_text)
+        return True, response.text.strip()
+    except Exception as e:
+        return False, "I'm having trouble processing your message. Could you please try again?"
+
 def process_calendar_request(user_text, gemini_model, calendar_service):
     """
-    Process a user's calendar request with support for multiple events.
+    Process a user's message, handling calendar actions, intents, and general conversation.
     Returns a tuple of (success, response_message).
     """
     try:
-        # Parse natural language input to get multiple events
+        # First determine the message type
+        message_type = detect_message_type(user_text, gemini_model)
+        
+        if message_type == 'general_conversation':
+            return handle_general_conversation(user_text, gemini_model)
+            
+        if message_type == 'calendar_intent':
+            return handle_calendar_intent(user_text, gemini_model)
+        
+        # If it's a calendar action, proceed with existing logic
         events = parse_natural_language(user_text, gemini_model)
         
-        # If we couldn't parse any events, return the clarification message
+        # If we couldn't parse any events, treat it as a calendar intent
         if not events or (len(events) == 1 and events[0]['action'] == 'UNKNOWN'):
-            return True, events[0].get('clarification', 
-                "I'm not sure what you'd like to schedule. Could you rephrase that?")
+            return handle_calendar_intent(user_text, gemini_model)
         
         # Process each event
         responses = []
@@ -911,7 +995,8 @@ def process_calendar_request(user_text, gemini_model, calendar_service):
         return True, final_response
         
     except Exception as e:
-        return False, f"Something unexpected happened. Please try again with a simpler request. Error details: {str(e)}"
+        # If any error occurs, try to handle it as a calendar intent
+        return handle_calendar_intent(user_text, gemini_model)
 
 class TimeSlot:
     """Represents a time slot for an event."""
